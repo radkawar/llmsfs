@@ -3,51 +3,51 @@ name = "llmsfs"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-  "torch>=2.2.2,<2.6; sys_platform == 'darwin' and platform_machine == 'x86_64' and python_version <= '3.14'",
-  "torch>=2.2.2; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version <= '3.14'",
-  "torch>=2.2.2; sys_platform == 'linux' and python_version <= '3.14'",
-  "torch>=2.2.2; sys_platform == 'win32' and python_version <= '3.14'",
-  "tensorflow>=2.16.2; sys_platform == 'darwin' and platform_machine == 'x86_64' and python_version < '3.13'",
-  "tensorflow>=2.18.0; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version < '3.13'",
-  "tensorflow-cpu>=2.18.0; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version < '3.13'",
-  "tensorflow>=2.18.0; sys_platform == 'linux' and platform_machine == 'aarch64' and python_version < '3.13'",
-  "tensorflow-cpu>=2.18.0; sys_platform == 'win32' and python_version < '3.13'",
-  "jupyterlab>=4.0",
-  "tiktoken>=0.5.1",
-  "matplotlib>=3.7.1",
-  "tqdm>=4.66.1",
-  "numpy>=1.26",
-  "pandas>=2.2.1",
-  "pip>=25.0.1",
-  "pytest>=9.1.1",
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  "tensorflow==2.21.0",
+  "jupyterlab==4.6.2",
+  "tiktoken==0.13.0",
+  "matplotlib==3.11.1",
+  "tqdm==4.70.0",
+  "numpy==2.5.1",
+  "pandas==3.0.5",
+  "pip==26.2.1",
+  "psutil==7.2.2",
+  "pytest==9.1.1",
+  "gymnasium[classic-control]>=1.3.0",
+  "seaborn>=0.13.2",
 ]
 
 [dependency-groups]
 dev = [
-    "build>=1.2.2.post1",
-    "twine>=6.1.0",
-    "tokenizers>=0.22.0",
-    "safetensors>=0.6.2",
+    "build==1.5.0",
+    "ruff==0.16.2",
+    "setuptools==84.0.0",
+    "twine==7.0.0",
+    "tokenizers==0.22.2",
+    "safetensors==0.8.0",
 ]
 bonus = [
-    "blobfile>=3.0.0",
-    "chainlit>=1.2.0",
-    "huggingface_hub>=0.34.4",
-    "ipywidgets>=8.1.2",
-    "llms_from_scratch>=1.0.18",
-    "openai>=1.30.3",
-    "requests",
-    "safetensors>=0.6.2",
-    "scikit-learn>=1.3.1",
-    "sentencepiece>=0.1.99",
-    "thop",
-    "tokenizers>=0.21.1",
-    "transformers>=5.0.0",
-    "tqdm>=4.65.0",
+    "blobfile==3.2.0",
+    "chainlit==2.11.1",
+    "huggingface_hub==1.27.0",
+    "ipywidgets==8.1.8",
+    "openai==2.53.0",
+    "requests==2.34.2",
+    "safetensors==0.8.0",
+    "scikit-learn==1.9.0",
+    "sentencepiece==0.2.2",
+    "thop==0.1.1.post2209072238",
+    "tokenizers==0.22.2",
+    "transformers==5.14.1",
+    "tqdm==4.70.0",
 ]
 
+[tool.uv]
+package = false
 
 [tool.ruff]
 line-length = 140
@@ -59,11 +59,3 @@ ignore = [
     "C406", "E226", "E402", "E702", "E703",
     "E722", "E731", "E741"
 ]
-
-# `llms_from_scratch` PyPI package
-[tool.setuptools]
-package-dir = {"" = "pkg"}
-
-[tool.setuptools.packages.find]
-where = ["pkg"]
-
