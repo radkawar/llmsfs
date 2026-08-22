@@ -1,6 +1,6 @@
 # Transformer from scratch
 
-An educational encoder-decoder Transformer written in PyTorch and trained to translate English into Italian. The implementation includes word-level tokenization, causal masking, training and validation, checkpointing, a command-line translator, and training/inference notebooks.
+An educational encoder-decoder Transformer written in PyTorch and trained to translate English into Italian. The default experiment uses byte-level BPE so punctuation, whitespace, unseen names, and subword structure are represented without handwritten text cleanup.
 
 ## Setup
 
@@ -17,18 +17,22 @@ No manual dataset download is required. The first training run downloads the `op
 The direct command is:
 
 ```bash
-uv run python follow/transformer_from_scratch/train.py
+uv run python follow/transformer_from_scratch/train.py \
+  --config follow/transformer_from_scratch/configs/en_it_bpe.toml
 ```
 
 The Apple-Silicon defaults train for 20 total epochs with a batch size of 64 and BF16 mixed precision. To force a fresh optimized run:
 
 ```bash
-uv run python follow/transformer_from_scratch/train.py --no-resume
+uv run python follow/transformer_from_scratch/train.py \
+  --config follow/transformer_from_scratch/configs/en_it_bpe.toml \
+  --no-resume
 ```
 
 Useful options:
 
 - `--epochs N` sets the total target epoch count, including resumed epochs.
+- `--config PATH` selects a complete TOML experiment without editing Python files.
 - `--batch-size N` lowers or raises memory use.
 - `--learning-rate RATE` overrides the default `3e-4`.
 - `--precision auto|bfloat16|float16|float32` controls mixed precision; `auto` selects BF16 on MPS.
@@ -41,10 +45,12 @@ Training resumes from the newest checkpoint by default. If the newest file is `t
 To evaluate the latest checkpoint without training another epoch:
 
 ```bash
-uv run python follow/transformer_from_scratch/train.py --evaluate-only
+uv run python follow/transformer_from_scratch/train.py \
+  --config follow/transformer_from_scratch/configs/en_it_bpe.toml \
+  --evaluate-only
 ```
 
-Evaluation now reports token-weighted, teacher-forced loss over the entire validation split. It then generates a fixed set drawn from the short, medium, and long thirds of that split, so qualitative changes are compared against representative examples rather than whichever two rows happen to come first. The default generation limit is the full 320 tokens.
+Evaluation reports token-weighted, teacher-forced loss over the entire validation split. It then generates six fixed short, medium, and long examples. Those fixed rows make CER, WER, BLEU, and the actual translations comparable across experiments. Per-token loss is not directly comparable when tokenizers differ because BPE and WordLevel produce different numbers of prediction steps. The generation limit is the full 320 tokens.
 
 For notebook-based training, launch Jupyter from this directory and open `training.ipynb`:
 
@@ -55,22 +61,29 @@ uv run jupyter lab
 
 The notebook exposes the same configuration, training loop, and TensorBoard logs as the CLI.
 
+## Experiment configs
+
+[`configs/en_it_bpe.toml`](configs/en_it_bpe.toml) defines the complete run: dataset, languages, tokenizer type and size, model/training settings, validation samples, and artifact paths. Copy it under `configs/` to create another experiment; no edit to `config.py` is required.
+
+`tokenization.py` exposes the common tokenizer builder interface. It currently supports `byte_bpe` and `wordlevel`, although byte-level BPE is the configured experiment.
+
 ## Training outputs
 
-All generated files are anchored to this directory, regardless of the shell's current working directory:
+The BPE config keeps generated files together under `artifacts/en-it/byte_bpe-v16000/`:
 
-- `tokenizer_en.json` and `tokenizer_it.json` contain the learned vocabularies.
-- `opus_books_weights_mps/tmodel_XX.pt` contains one optimized checkpoint per epoch.
-- `runs/tmodel_mps/` contains TensorBoard events.
+- `tokenizers/en.json` and `tokenizers/it.json` contain the learned BPE vocabularies and merges.
+- `checkpoints/tmodel_XX.pt` contains one checkpoint per epoch.
+- `runs/` contains TensorBoard events.
 
-These artifacts are required for inference. The model architecture settings in `config.py`, especially `seq_len` and `d_model`, must match the checkpoint used for inference.
+These artifacts are ignored by Git. Training and inference must use the same TOML config because vocabulary and architecture settings must match the checkpoint.
 
 ## Run inference
 
 After at least one epoch has produced a checkpoint:
 
 ```bash
-uv run python follow/transformer_from_scratch/translate.py "I am a student."
+uv run python follow/transformer_from_scratch/translate.py "I am a student." \
+  --config follow/transformer_from_scratch/configs/en_it_bpe.toml
 ```
 
 This uses a beam width of 3, length normalization, and 3-gram repetition blocking. Useful controls include:
@@ -86,15 +99,17 @@ For interactive use, open `inference.ipynb`, load the model once, and edit the `
 
 Generation starts with `[SOS]` and predicts until `[EOS]` or the length limit. It uses an incremental KV cache: each decoder layer stores previously projected self-attention keys/values and stores its encoder cross-attention keys/values once. The decoder therefore processes only the new token instead of recomputing the entire prefix. Beam search keeps several promising partial translations and reorders their caches whenever a different parent beam wins.
 
-The current `WordLevel` tokenizer splits punctuation into separate tokens. A small punctuation-aware cleanup step removes display artifacts such as `word ,` and `Arkad ’ ic`; this changes formatting, not the model's underlying token choices.
+The byte-level BPE decoder reconstructs text directly from generated tokens. There is no punctuation regex: spacing and punctuation are present in the training representation and must be predicted by the model.
 
 ## Files
 
 - `model.py` implements embeddings, positional encoding, attention, encoder/decoder blocks, and the final vocabulary projection.
 - `dataset.py` tokenizes sentence pairs and builds encoder padding masks plus decoder padding/causal masks.
-- `config.py` contains typed settings and artifact paths.
+- `configs/` contains selectable TOML experiments.
+- `config.py` validates and resolves experiment settings and artifact paths.
+- `tokenization.py` implements the WordLevel/byte-BPE tokenizer interface.
 - `train.py` downloads data, builds tokenizers, trains, validates, logs metrics, and saves/resumes checkpoints.
-- `translate.py` contains cached greedy/beam decoding, repetition controls, punctuation cleanup, checkpoint loading, and the translation CLI.
+- `translate.py` contains cached greedy/beam decoding, repetition controls, checkpoint loading, and the translation CLI.
 - `training.ipynb` runs and monitors training interactively.
 - `inference.ipynb` loads a trained checkpoint and translates custom sentences.
 

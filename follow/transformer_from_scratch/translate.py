@@ -1,5 +1,4 @@
 import argparse
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -10,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-from config import TransformerConfig, get_config, get_tokenizer_file_path, latest_weights_file_path
+from config import TransformerConfig, get_tokenizer_file_path, latest_weights_file_path, load_config
 from dataset import special_token_id
 from model import AttentionKVCache, DecoderLayerCache, Transformer, build_transformer
 
@@ -26,18 +25,10 @@ class InferenceBundle:
     checkpoint_path: Path
 
 
-def clean_decoded_text(text: str) -> str:
-    """Undo spacing artifacts introduced by the simple word-level decoder."""
-    text = re.sub(r"\s+([,.;:!?%…\)\]\}»])", r"\1", text)
-    text = re.sub(r"([«\(\[\{])\s+", r"\1", text)
-    text = re.sub(r"\s*([’'])\s*", r"\1", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def decode_token_ids(tokenizer: Tokenizer, token_ids: torch.Tensor | list[int]) -> str:
-    """Decode target IDs and apply punctuation-aware spacing cleanup."""
+    """Decode target IDs."""
     ids = token_ids.detach().cpu().tolist() if isinstance(token_ids, torch.Tensor) else token_ids
-    return clean_decoded_text(tokenizer.decode(ids, skip_special_tokens=True))
+    return tokenizer.decode(ids, skip_special_tokens=True)
 
 
 def load_inference_bundle(
@@ -46,7 +37,7 @@ def load_inference_bundle(
     device: str | torch.device | None = None,
 ) -> InferenceBundle:
     """Load tokenizers, construct the model, and restore a checkpoint."""
-    config = get_config() if config is None else config
+    config = load_config() if config is None else config
     resolved_device = select_device(device)
     configure_runtime(resolved_device, config["seed"])
     amp_dtype = resolve_amp_dtype(resolved_device, config["precision"])
@@ -440,6 +431,7 @@ def translate(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Translate English text with the latest trained checkpoint.")
     parser.add_argument("sentence", nargs="?", default="I am a student.")
+    parser.add_argument("--config", type=str, help="TOML experiment file; defaults to configs/en_it_bpe.toml.")
     parser.add_argument("--checkpoint", type=Path, help="Use a specific .pt checkpoint instead of the latest one.")
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--beam-size", type=int, default=3, help="Use 1 for greedy decoding; 3-5 is a practical beam width.")
@@ -449,7 +441,8 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, help="Maximum output tokens, including [SOS].")
     args = parser.parse_args()
 
-    bundle = load_inference_bundle(checkpoint_path=args.checkpoint, device=args.device)
+    config = load_config(args.config)
+    bundle = load_inference_bundle(config=config, checkpoint_path=args.checkpoint, device=args.device)
     print(f"Device:     {bundle.device}")
     print(f"Precision:  {bundle.amp_dtype or torch.float32}")
     print(f"Checkpoint: {bundle.checkpoint_path}")

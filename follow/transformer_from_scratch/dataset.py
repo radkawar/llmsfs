@@ -71,6 +71,7 @@ class BilingualDataset(Dataset[BilingualSample]):
         self.lengths: list[int] = []
         self.max_src_len = 0
         self.max_tgt_len = 0
+        self.skipped_count = 0
 
         for src_text, tgt_text, src_encoding, tgt_encoding in zip(
             src_texts,
@@ -84,7 +85,8 @@ class BilingualDataset(Dataset[BilingualSample]):
             src_len = len(src_ids) + 2  # [SOS] source [EOS]
             tgt_len = len(tgt_ids) + 1  # [SOS] target / target [EOS]
             if src_len > seq_len or tgt_len > seq_len:
-                raise ValueError(f"Sentence pair is too long for seq_len={seq_len}: source={src_len} tokens, target={tgt_len} tokens")
+                self.skipped_count += 1
+                continue
 
             self.samples.append(
                 {
@@ -97,6 +99,9 @@ class BilingualDataset(Dataset[BilingualSample]):
             self.lengths.append(max(src_len, tgt_len))
             self.max_src_len = max(self.max_src_len, src_len)
             self.max_tgt_len = max(self.max_tgt_len, tgt_len)
+
+        if not self.samples:
+            raise ValueError(f"No sentence pairs fit within seq_len={seq_len}")
 
     def __len__(self) -> int:
         return len(self.samples)

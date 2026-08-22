@@ -1,24 +1,34 @@
+import tomllib
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, cast
+
+from tokenization import TokenizerType
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = PROJECT_DIR / "configs" / "en_it_bpe.toml"
 
 
 class TransformerConfig(TypedDict):
+    name: str
     batch_size: int
     num_epochs: int
     lr: float
     seq_len: int
     d_model: int
     datasource: str
+    dataset_config: str
     lang_src: str
     lang_tgt: str
-    model_folder: str
     model_basename: str
     preload: str | None
-    tokenizer_file: str
-    experiment_name: str
+    checkpoint_folder: str
+    tokenizer_folder: str
+    tokenizer_filename: str
+    experiment_folder: str
+    tokenizer_type: TokenizerType
+    tokenizer_vocab_size: int
+    tokenizer_min_frequency: int
     seed: int
     precision: Literal["auto", "float32", "float16", "bfloat16"]
     pad_to_multiple_of: int
@@ -28,46 +38,56 @@ class TransformerConfig(TypedDict):
     tie_target_embeddings: bool
     validation_max_len: int
     validation_examples_per_bucket: int
+    validation_example_indices: list[int]
     validation_beam_size: int
     validation_length_penalty: float
     validation_no_repeat_ngram_size: int
 
 
-def get_config() -> TransformerConfig:
-    """Return the default English-to-Italian training configuration."""
-    return {
-        "batch_size": 64,
-        "num_epochs": 20,
-        "lr": 3e-4,
-        "seq_len": 320,
-        "d_model": 512,
-        "datasource": "Helsinki-NLP/opus_books",
-        "lang_src": "en",
-        "lang_tgt": "it",
-        "model_folder": "weights_mps",
-        "model_basename": "tmodel_",
-        "preload": "latest",
-        "tokenizer_file": "tokenizer_{0}.json",
-        "experiment_name": "runs/tmodel_mps",
-        "seed": 1337,
-        "precision": "auto",
-        "pad_to_multiple_of": 8,
-        "bucket_size_multiplier": 10,
-        "log_every": 20,
-        # Explicit matmul attention benchmarks faster than SDPA on MPS 2.13.
-        "use_fused_attention": False,
-        "tie_target_embeddings": True,
-        "validation_max_len": 320,
-        "validation_examples_per_bucket": 2,
-        "validation_beam_size": 3,
-        "validation_length_penalty": 0.6,
-        "validation_no_repeat_ngram_size": 3,
-    }
+def resolve_config_path(config_path: str | Path | None = None) -> Path:
+    """Resolve CLI paths from the current directory, then from this project directory."""
+    if config_path is None:
+        return DEFAULT_CONFIG_PATH
+
+    path = Path(config_path).expanduser()
+    if path.is_file():
+        return path.resolve()
+    project_relative_path = PROJECT_DIR / path
+    if project_relative_path.is_file():
+        return project_relative_path.resolve()
+    raise FileNotFoundError(f"Config file does not exist: {config_path}")
+
+
+def load_config(config_path: str | Path | None = None) -> TransformerConfig:
+    """Load one complete experiment configuration from a TOML file."""
+    resolved_path = resolve_config_path(config_path)
+    with resolved_path.open("rb") as config_file:
+        raw_config = tomllib.load(config_file)
+
+    required_keys = set(TransformerConfig.__required_keys__)
+    missing_keys = sorted(required_keys - raw_config.keys())
+    unexpected_keys = sorted(raw_config.keys() - required_keys)
+    if missing_keys or unexpected_keys:
+        problems: list[str] = []
+        if missing_keys:
+            problems.append(f"missing {', '.join(missing_keys)}")
+        if unexpected_keys:
+            problems.append(f"unexpected {', '.join(unexpected_keys)}")
+        raise ValueError(f"Invalid config {resolved_path}: {'; '.join(problems)}")
+
+    tokenizer_type = raw_config["tokenizer_type"]
+    if tokenizer_type not in {"wordlevel", "byte_bpe"}:
+        raise ValueError(f"Unknown tokenizer_type {tokenizer_type!r} in {resolved_path}")
+    return cast(TransformerConfig, raw_config)
+
+
+def _project_path(configured_path: str) -> Path:
+    path = Path(configured_path).expanduser()
+    return path.resolve() if path.is_absolute() else (PROJECT_DIR / path).resolve()
 
 
 def get_weights_folder_path(config: TransformerConfig) -> Path:
-    dataset_name = config["datasource"].rsplit("/", maxsplit=1)[-1]
-    return PROJECT_DIR / f"{dataset_name}_{config['model_folder']}"
+    return _project_path(config["checkpoint_folder"])
 
 
 def get_weights_file_path(config: TransformerConfig, epoch: int | str) -> Path:
@@ -83,8 +103,9 @@ def latest_weights_file_path(config: TransformerConfig) -> Path | None:
 
 
 def get_tokenizer_file_path(config: TransformerConfig, language: str) -> Path:
-    return PROJECT_DIR / config["tokenizer_file"].format(language)
+    filename = config["tokenizer_filename"].format(language=language)
+    return _project_path(config["tokenizer_folder"]) / filename
 
 
 def get_experiment_path(config: TransformerConfig) -> Path:
-    return PROJECT_DIR / config["experiment_name"]
+    return _project_path(config["experiment_folder"])

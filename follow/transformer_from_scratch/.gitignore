@@ -1,3 +1,4 @@
 tokenizer_*.json
 *_weights_*/
 runs/
+artifacts/

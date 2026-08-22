@@ -12,9 +12,6 @@ import torch.nn.functional as F
 from datasets import Dataset as HFDataset
 from datasets import load_dataset
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
-from tokenizers.trainers import WordLevelTrainer
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.text import BLEUScore, CharErrorRate, WordErrorRate
@@ -22,12 +19,12 @@ from tqdm.auto import tqdm
 
 from config import (
     TransformerConfig,
-    get_config,
     get_experiment_path,
     get_tokenizer_file_path,
     get_weights_file_path,
     get_weights_folder_path,
     latest_weights_file_path,
+    load_config,
 )
 from dataset import (
     BilingualBatch,
@@ -40,6 +37,7 @@ from dataset import (
     special_token_id,
 )
 from model import Transformer, build_transformer
+from tokenization import build_tokenizer
 from translate import decode, decode_token_ids
 
 
@@ -182,15 +180,17 @@ def get_all_sentences(ds: HFDataset, language: str) -> Iterator[str]:
 def get_or_build_tokenizer(config: TransformerConfig, ds: HFDataset, language: str) -> Tokenizer:
     tokenizer_path = get_tokenizer_file_path(config, language)
     if tokenizer_path.exists():
+        print(f"Loading {config['tokenizer_type']} {language} tokenizer: {tokenizer_path}")
         return Tokenizer.from_file(str(tokenizer_path))
 
-    tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
-    tokenizer.pre_tokenizer = Whitespace()
-    trainer = WordLevelTrainer(
-        special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"],
-        min_frequency=2,
+    print(f"Training {config['tokenizer_type']} {language} tokenizer (vocab target {config['tokenizer_vocab_size']:,})...")
+    tokenizer = build_tokenizer(
+        config["tokenizer_type"],
+        get_all_sentences(ds, language),
+        config["tokenizer_vocab_size"],
+        config["tokenizer_min_frequency"],
     )
-    tokenizer.train_from_iterator(get_all_sentences(ds, language), trainer=trainer)
+    tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(tokenizer_path))
     return tokenizer
 
@@ -207,7 +207,7 @@ def get_ds(
 ]:
     raw_dataset = load_dataset(
         config["datasource"],
-        f"{config['lang_src']}-{config['lang_tgt']}",
+        config["dataset_config"],
         split="train",
     )
     if not isinstance(raw_dataset, HFDataset):
@@ -256,7 +256,19 @@ def get_ds(
         DataLoader(val_ds, batch_sampler=validation_batch_sampler, collate_fn=collator),
     )
 
-    selected_examples = representative_indices(val_ds, config["validation_examples_per_bucket"])
+    configured_indices = config["validation_example_indices"]
+    if configured_indices:
+        examples_per_bucket = config["validation_examples_per_bucket"]
+        expected_count = 3 * examples_per_bucket
+        if len(configured_indices) != expected_count:
+            raise ValueError(f"Expected {expected_count} validation_example_indices, received {len(configured_indices)}")
+        if any(index < 0 or index >= len(val_ds) for index in configured_indices):
+            raise ValueError("A validation_example_indices entry is outside the validation split")
+        selected_examples = [
+            (("short", "medium", "long")[position // examples_per_bucket], index) for position, index in enumerate(configured_indices)
+        ]
+    else:
+        selected_examples = representative_indices(val_ds, config["validation_examples_per_bucket"])
     length_buckets = [bucket for bucket, _ in selected_examples]
     representative_ds = Subset(val_ds, [index for _, index in selected_examples])
     validation_generation_dataloader = cast(
@@ -268,6 +280,8 @@ def get_ds(
     max_tgt_len = max(train_ds.max_tgt_len, val_ds.max_tgt_len)
     print(f"Maximum source/target lengths: {max_src_len}/{max_tgt_len} tokens")
     print(f"Training/validation examples: {len(train_ds):,}/{len(val_ds):,}")
+    if train_ds.skipped_count or val_ds.skipped_count:
+        print(f"Skipped over-length training/validation pairs: {train_ds.skipped_count:,}/{val_ds.skipped_count:,}")
     print(f"Dynamic padding + length bucketing: {len(train_dataloader):,} batches (batch size {config['batch_size']})")
     print(
         f"Validation: {len(validation_loss_dataloader):,} teacher-forced batches + "
@@ -317,6 +331,8 @@ def train_model(
 
     print(f"Device: {device}")
     print(f"Precision: {amp_dtype or torch.float32}")
+    print(f"Experiment: {config['name']}")
+    print(f"Tokenizer: {config['tokenizer_type']} (target vocab {config['tokenizer_vocab_size']:,})")
     attention_backend = "scaled-dot-product" if config["use_fused_attention"] else "MPS-fast explicit matmul"
     print(f"Optimizations: dynamic padding, length bucketing, cached tokenization, {attention_backend} attention, fused LayerNorm")
     get_weights_folder_path(config).mkdir(parents=True, exist_ok=True)
@@ -523,7 +539,8 @@ def train_model(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the English-to-Italian Transformer.")
+    parser = argparse.ArgumentParser(description="Train a configured translation Transformer.")
+    parser.add_argument("--config", type=str, help="TOML experiment file; defaults to configs/en_it_bpe.toml.")
     parser.add_argument("--epochs", type=int, help="Total epoch count, including any resumed epochs.")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--learning-rate", type=float)
@@ -539,7 +556,7 @@ def main() -> None:
     parser.add_argument("--validation-no-repeat-ngram-size", type=int)
     args = parser.parse_args()
 
-    config = get_config()
+    config = load_config(args.config)
     if args.epochs is not None:
         config["num_epochs"] = args.epochs
     if args.batch_size is not None:

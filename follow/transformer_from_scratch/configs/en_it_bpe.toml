@@ -1,0 +1,39 @@
+name = "English to Italian — byte-level BPE"
+
+datasource = "Helsinki-NLP/opus_books"
+dataset_config = "en-it"
+lang_src = "en"
+lang_tgt = "it"
+
+tokenizer_type = "byte_bpe"
+tokenizer_vocab_size = 16000
+tokenizer_min_frequency = 2
+tokenizer_folder = "artifacts/en-it/byte_bpe-v16000/tokenizers"
+tokenizer_filename = "{language}.json"
+
+checkpoint_folder = "artifacts/en-it/byte_bpe-v16000/checkpoints"
+model_basename = "tmodel_"
+preload = "latest"
+experiment_folder = "artifacts/en-it/byte_bpe-v16000/runs"
+
+batch_size = 64
+num_epochs = 20
+lr = 0.0003
+seq_len = 320
+d_model = 512
+seed = 1337
+precision = "auto"
+
+pad_to_multiple_of = 8
+bucket_size_multiplier = 10
+log_every = 20
+use_fused_attention = false
+tie_target_embeddings = true
+
+validation_max_len = 320
+validation_examples_per_bucket = 2
+# Fixed rows from the deterministic validation split make experiments comparable.
+validation_example_indices = [1480, 86, 2446, 2390, 3039, 2112]
+validation_beam_size = 3
+validation_length_penalty = 0.6
+validation_no_repeat_ngram_size = 3
