@@ -38,6 +38,14 @@ Useful options:
 
 Training resumes from the newest checkpoint by default. If the newest file is `tmodel_04.pt` and `--epochs 10` is used, training continues with epoch 05 and finishes after epoch 09.
 
+To evaluate the latest checkpoint without training another epoch:
+
+```bash
+uv run python follow/transformer_from_scratch/train.py --evaluate-only
+```
+
+Evaluation now reports token-weighted, teacher-forced loss over the entire validation split. It then generates a fixed set drawn from the short, medium, and long thirds of that split, so qualitative changes are compared against representative examples rather than whichever two rows happen to come first. The default generation limit is the full 320 tokens.
+
 For notebook-based training, launch Jupyter from this directory and open `training.ipynb`:
 
 ```bash
@@ -65,9 +73,20 @@ After at least one epoch has produced a checkpoint:
 uv run python follow/transformer_from_scratch/translate.py "I am a student."
 ```
 
-Use `--checkpoint PATH` to select a particular checkpoint or `--device cpu` to force CPU inference. For interactive use, open `inference.ipynb`, load the model once, and edit the `sentence` variable.
+This uses a beam width of 3, length normalization, and 3-gram repetition blocking. Useful controls include:
 
-Inference uses greedy decoding: the decoder starts with `[SOS]`, chooses the highest-logit next token, appends it, and repeats until it predicts `[EOS]` or reaches `seq_len`.
+- `--beam-size 1` switches to greedy decoding; values from 3 to 5 are normally enough.
+- `--no-repeat-ngram-size 0` disables repetition blocking.
+- `--repetition-penalty 1.1` additionally lowers the score of tokens already used.
+- `--length-penalty 0.6` controls beam search's preference for longer candidates.
+- `--max-length 320` controls the output limit.
+- `--checkpoint PATH` selects a checkpoint and `--device cpu` forces CPU inference.
+
+For interactive use, open `inference.ipynb`, load the model once, and edit the `sentence` variable.
+
+Generation starts with `[SOS]` and predicts until `[EOS]` or the length limit. It uses an incremental KV cache: each decoder layer stores previously projected self-attention keys/values and stores its encoder cross-attention keys/values once. The decoder therefore processes only the new token instead of recomputing the entire prefix. Beam search keeps several promising partial translations and reorders their caches whenever a different parent beam wins.
+
+The current `WordLevel` tokenizer splits punctuation into separate tokens. A small punctuation-aware cleanup step removes display artifacts such as `word ,` and `Arkad ’ ic`; this changes formatting, not the model's underlying token choices.
 
 ## Files
 
@@ -75,7 +94,7 @@ Inference uses greedy decoding: the decoder starts with `[SOS]`, chooses the hig
 - `dataset.py` tokenizes sentence pairs and builds encoder padding masks plus decoder padding/causal masks.
 - `config.py` contains typed settings and artifact paths.
 - `train.py` downloads data, builds tokenizers, trains, validates, logs metrics, and saves/resumes checkpoints.
-- `translate.py` contains the shared greedy decoder, checkpoint loader, and translation CLI.
+- `translate.py` contains cached greedy/beam decoding, repetition controls, punctuation cleanup, checkpoint loading, and the translation CLI.
 - `training.ipynb` runs and monitors training interactively.
 - `inference.ipynb` loads a trained checkpoint and translates custom sentences.
 
@@ -107,5 +126,6 @@ The training path is tuned for this project's M5 Max machine:
 - Explicit matmul attention, which benchmarked about 19% faster than PyTorch SDPA on this MPS setup.
 - Fused Adam and fewer GPU synchronizations from progress/TensorBoard logging.
 - MPS fast-math and native Metal matmul preferences enabled before PyTorch initializes.
+- KV-cached incremental decoding for validation and inference (training remains fully parallel and does not need a cache).
 
 On the local 40-core M5 Max, a 100-batch end-to-end benchmark measured about 377 examples/second and estimated roughly 1.3 minutes of training compute per epoch. Checkpoint saving and validation add some time.

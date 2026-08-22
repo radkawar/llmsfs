@@ -27,6 +27,10 @@ class TransformerConfig(TypedDict):
     use_fused_attention: bool
     tie_target_embeddings: bool
     validation_max_len: int
+    validation_examples_per_bucket: int
+    validation_beam_size: int
+    validation_length_penalty: float
+    validation_no_repeat_ngram_size: int
 
 
 def get_config() -> TransformerConfig:
@@ -53,7 +57,11 @@ def get_config() -> TransformerConfig:
         # Explicit matmul attention benchmarks faster than SDPA on MPS 2.13.
         "use_fused_attention": False,
         "tie_target_embeddings": True,
-        "validation_max_len": 128,
+        "validation_max_len": 320,
+        "validation_examples_per_bucket": 2,
+        "validation_beam_size": 3,
+        "validation_length_penalty": 0.6,
+        "validation_no_repeat_ngram_size": 3,
     }
 
 

@@ -8,13 +8,14 @@ from runtime import configure_runtime, resolve_amp_dtype, select_device
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from datasets import Dataset as HFDataset
 from datasets import load_dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.trainers import WordLevelTrainer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.text import BLEUScore, CharErrorRate, WordErrorRate
 from tqdm.auto import tqdm
@@ -33,17 +34,64 @@ from dataset import (
     BilingualCollator,
     BilingualDataset,
     LengthBucketBatchSampler,
+    SortedBatchSampler,
     TranslationRows,
+    representative_indices,
     special_token_id,
 )
 from model import Transformer, build_transformer
-from translate import greedy_decode
+from translate import decode, decode_token_ids
 
 
 class ValidationMetrics(TypedDict):
     cer: float
     wer: float
     bleu: float
+
+
+def evaluate_validation_loss(
+    model: Transformer,
+    validation_ds: DataLoader[BilingualBatch],
+    tokenizer_tgt: Tokenizer,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    print_msg: Callable[[str], None],
+    global_step: int,
+    writer: SummaryWriter | None,
+) -> float:
+    """Measure teacher-forced, token-weighted loss over the full validation split."""
+    model.eval()
+    pad_id = special_token_id(tokenizer_tgt, "[PAD]")
+    total_loss = torch.zeros((), dtype=torch.float32, device=device)
+    total_tokens = 0
+
+    with torch.inference_mode():
+        for batch in validation_ds:
+            encoder_input = batch["encoder_input"].to(device, non_blocking=True)
+            decoder_input = batch["decoder_input"].to(device, non_blocking=True)
+            encoder_mask = batch["encoder_mask"].to(device, non_blocking=True)
+            decoder_mask = batch["decoder_mask"].to(device, non_blocking=True)
+            label = batch["label"].to(device, non_blocking=True)
+
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                logits = model(encoder_input, encoder_mask, decoder_input, decoder_mask)
+                summed_loss = F.cross_entropy(
+                    logits.reshape(-1, tokenizer_tgt.get_vocab_size()),
+                    label.reshape(-1),
+                    ignore_index=pad_id,
+                    label_smoothing=0.1,
+                    reduction="sum",
+                )
+            total_loss.add_(summed_loss.float())
+            total_tokens += batch["target_token_count"]
+
+    if total_tokens == 0:
+        raise ValueError("The validation split contained no target tokens")
+    average_loss = (total_loss / total_tokens).item()
+    print_msg(f"Full teacher-forced validation | loss {average_loss:.3f} | {total_tokens:,} target tokens")
+    if writer is not None:
+        writer.add_scalar("validation/loss", average_loss, global_step)
+    return average_loss
 
 
 def run_validation(
@@ -56,7 +104,10 @@ def run_validation(
     print_msg: Callable[[str], None],
     global_step: int,
     writer: SummaryWriter | None,
-    num_examples: int = 2,
+    length_buckets: list[str],
+    beam_size: int,
+    length_penalty: float,
+    no_repeat_ngram_size: int,
 ) -> ValidationMetrics:
     model.eval()
     expected: list[str] = []
@@ -70,7 +121,7 @@ def run_validation(
             if encoder_input.size(0) != 1:
                 raise ValueError("Validation requires a batch size of 1")
 
-            model_out = greedy_decode(
+            model_out = decode(
                 model,
                 encoder_input,
                 encoder_mask,
@@ -78,21 +129,26 @@ def run_validation(
                 max_len,
                 device,
                 amp_dtype,
+                beam_size=beam_size,
+                length_penalty=length_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
             )
             source_text = batch["src_text"][0]
             target_text = batch["tgt_text"][0]
-            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().tolist(), skip_special_tokens=True)
+            model_out_text = decode_token_ids(tokenizer_tgt, model_out)
             expected.append(target_text)
             predicted.append(model_out_text)
+            bucket = length_buckets[count - 1]
+            source_tokens = int(encoder_mask.sum().item())
+            target_tokens = batch["target_token_count"]
 
             print_msg("-" * console_width)
+            print_msg(f"{bucket.upper()} SAMPLE | source {source_tokens} tokens | target {target_tokens} tokens")
             print_msg(f"{'SOURCE: ':>12}{source_text}")
             print_msg(f"{'TARGET: ':>12}{target_text}")
             print_msg(f"{'PREDICTED: ':>12}{model_out_text}")
 
-            if count >= num_examples:
-                print_msg("-" * console_width)
-                break
+        print_msg("-" * console_width)
 
     if not predicted:
         return {"cer": 0.0, "wer": 0.0, "bleu": 0.0}
@@ -102,7 +158,11 @@ def run_validation(
         "wer": WordErrorRate()(predicted, expected).item(),
         "bleu": BLEUScore()(predicted, expected).item(),
     }
-    print_msg(f"Validation on {len(predicted)} examples | CER {metrics['cer']:.3f} | WER {metrics['wer']:.3f} | BLEU {metrics['bleu']:.3f}")
+    strategy = "greedy" if beam_size == 1 else f"beam {beam_size}"
+    print_msg(
+        f"Representative generation ({strategy}, {len(predicted)} examples) | "
+        f"CER {metrics['cer']:.3f} | WER {metrics['wer']:.3f} | BLEU {metrics['bleu']:.3f}"
+    )
 
     if writer is not None:
         writer.add_scalar("validation/cer", metrics["cer"], global_step)
@@ -137,7 +197,14 @@ def get_or_build_tokenizer(config: TransformerConfig, ds: HFDataset, language: s
 
 def get_ds(
     config: TransformerConfig,
-) -> tuple[DataLoader[BilingualBatch], DataLoader[BilingualBatch], Tokenizer, Tokenizer]:
+) -> tuple[
+    DataLoader[BilingualBatch],
+    DataLoader[BilingualBatch],
+    DataLoader[BilingualBatch],
+    list[str],
+    Tokenizer,
+    Tokenizer,
+]:
     raw_dataset = load_dataset(
         config["datasource"],
         f"{config['lang_src']}-{config['lang_tgt']}",
@@ -183,9 +250,18 @@ def get_ds(
         DataLoader[BilingualBatch],
         DataLoader(train_ds, batch_sampler=batch_sampler, collate_fn=collator),
     )
-    val_dataloader = cast(
+    validation_batch_sampler = SortedBatchSampler(val_ds, config["batch_size"])
+    validation_loss_dataloader = cast(
         DataLoader[BilingualBatch],
-        DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collator),
+        DataLoader(val_ds, batch_sampler=validation_batch_sampler, collate_fn=collator),
+    )
+
+    selected_examples = representative_indices(val_ds, config["validation_examples_per_bucket"])
+    length_buckets = [bucket for bucket, _ in selected_examples]
+    representative_ds = Subset(val_ds, [index for _, index in selected_examples])
+    validation_generation_dataloader = cast(
+        DataLoader[BilingualBatch],
+        DataLoader(representative_ds, batch_size=1, shuffle=False, collate_fn=collator),
     )
 
     max_src_len = max(train_ds.max_src_len, val_ds.max_src_len)
@@ -193,7 +269,18 @@ def get_ds(
     print(f"Maximum source/target lengths: {max_src_len}/{max_tgt_len} tokens")
     print(f"Training/validation examples: {len(train_ds):,}/{len(val_ds):,}")
     print(f"Dynamic padding + length bucketing: {len(train_dataloader):,} batches (batch size {config['batch_size']})")
-    return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
+    print(
+        f"Validation: {len(validation_loss_dataloader):,} teacher-forced batches + "
+        f"{len(validation_generation_dataloader)} representative generations"
+    )
+    return (
+        train_dataloader,
+        validation_loss_dataloader,
+        validation_generation_dataloader,
+        length_buckets,
+        tokenizer_src,
+        tokenizer_tgt,
+    )
 
 
 def get_model(config: TransformerConfig, vocab_src_len: int, vocab_tgt_len: int) -> Transformer:
@@ -216,7 +303,12 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:d}m {remaining_seconds:02d}s"
 
 
-def train_model(config: TransformerConfig, requested_device: str | torch.device | None = None) -> None:
+def train_model(
+    config: TransformerConfig,
+    requested_device: str | torch.device | None = None,
+    *,
+    evaluate_only: bool = False,
+) -> None:
     device = select_device(requested_device)
     configure_runtime(device, config["seed"])
     amp_dtype = resolve_amp_dtype(device, config["precision"])
@@ -229,7 +321,14 @@ def train_model(config: TransformerConfig, requested_device: str | torch.device 
     print(f"Optimizations: dynamic padding, length bucketing, cached tokenization, {attention_backend} attention, fused LayerNorm")
     get_weights_folder_path(config).mkdir(parents=True, exist_ok=True)
 
-    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
+    (
+        train_dataloader,
+        validation_loss_dataloader,
+        validation_generation_dataloader,
+        validation_length_buckets,
+        tokenizer_src,
+        tokenizer_tgt,
+    ) = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     print(f"Trainable parameters: {trainable_parameters / 1_000_000:.1f}M")
@@ -273,6 +372,37 @@ def train_model(config: TransformerConfig, requested_device: str | torch.device 
         ignore_index=special_token_id(tokenizer_tgt, "[PAD]"),
         label_smoothing=0.1,
     ).to(device)
+
+    if evaluate_only:
+        try:
+            evaluate_validation_loss(
+                model,
+                validation_loss_dataloader,
+                tokenizer_tgt,
+                device,
+                amp_dtype,
+                print,
+                global_step,
+                writer,
+            )
+            run_validation(
+                model,
+                validation_generation_dataloader,
+                tokenizer_tgt,
+                min(config["validation_max_len"], config["seq_len"]),
+                device,
+                amp_dtype,
+                print,
+                global_step,
+                writer,
+                validation_length_buckets,
+                config["validation_beam_size"],
+                config["validation_length_penalty"],
+                config["validation_no_repeat_ngram_size"],
+            )
+        finally:
+            writer.close()
+        return
 
     try:
         for epoch in range(initial_epoch, config["num_epochs"]):
@@ -358,9 +488,19 @@ def train_model(config: TransformerConfig, requested_device: str | torch.device 
             )
             print(f"Saved checkpoint: {checkpoint_path}")
 
+            evaluate_validation_loss(
+                model,
+                validation_loss_dataloader,
+                tokenizer_tgt,
+                device,
+                amp_dtype,
+                batch_iterator.write,
+                global_step,
+                writer,
+            )
             run_validation(
                 model,
-                val_dataloader,
+                validation_generation_dataloader,
                 tokenizer_tgt,
                 min(config["validation_max_len"], config["seq_len"]),
                 device,
@@ -368,6 +508,10 @@ def train_model(config: TransformerConfig, requested_device: str | torch.device 
                 batch_iterator.write,
                 global_step,
                 writer,
+                validation_length_buckets,
+                config["validation_beam_size"],
+                config["validation_length_penalty"],
+                config["validation_no_repeat_ngram_size"],
             )
 
             if device.type == "mps":
@@ -388,6 +532,11 @@ def main() -> None:
     parser.add_argument("--precision", choices=("auto", "float32", "float16", "bfloat16"))
     parser.add_argument("--no-resume", action="store_true", help="Ignore optimized-run checkpoints and train from scratch.")
     parser.add_argument("--sdpa-attention", action="store_true", help="Use PyTorch SDPA instead of the faster measured MPS path.")
+    parser.add_argument("--evaluate-only", action="store_true", help="Evaluate the latest checkpoint without training.")
+    parser.add_argument("--validation-beam-size", type=int)
+    parser.add_argument("--validation-max-length", type=int)
+    parser.add_argument("--validation-examples-per-bucket", type=int)
+    parser.add_argument("--validation-no-repeat-ngram-size", type=int)
     args = parser.parse_args()
 
     config = get_config()
@@ -405,8 +554,16 @@ def main() -> None:
         config["preload"] = None
     if args.sdpa_attention:
         config["use_fused_attention"] = True
+    if args.validation_beam_size is not None:
+        config["validation_beam_size"] = args.validation_beam_size
+    if args.validation_max_length is not None:
+        config["validation_max_len"] = args.validation_max_length
+    if args.validation_examples_per_bucket is not None:
+        config["validation_examples_per_bucket"] = args.validation_examples_per_bucket
+    if args.validation_no_repeat_ngram_size is not None:
+        config["validation_no_repeat_ngram_size"] = args.validation_no_repeat_ngram_size
 
-    train_model(config, args.device)
+    train_model(config, args.device, evaluate_only=args.evaluate_only)
 
 
 if __name__ == "__main__":

@@ -222,6 +222,45 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
         return math.ceil(len(self.dataset) / self.batch_size)
 
 
+class SortedBatchSampler(Sampler[list[int]]):
+    """Visit every example once in length-sorted batches for efficient validation."""
+
+    def __init__(self, dataset: BilingualDataset, batch_size: int) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        self.dataset = dataset
+        self.batch_size = batch_size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        sorted_indices = sorted(range(len(self.dataset)), key=self.dataset.sequence_length)
+        for start in range(0, len(sorted_indices), self.batch_size):
+            yield sorted_indices[start : start + self.batch_size]
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+
+def representative_indices(dataset: BilingualDataset, examples_per_bucket: int) -> list[tuple[str, int]]:
+    """Choose deterministic examples from the short, medium, and long thirds."""
+    if examples_per_bucket < 1:
+        raise ValueError("examples_per_bucket must be positive")
+    if len(dataset) < 3:
+        raise ValueError("At least three validation examples are required")
+
+    sorted_indices = sorted(range(len(dataset)), key=dataset.sequence_length)
+    boundaries = (0, len(sorted_indices) // 3, 2 * len(sorted_indices) // 3, len(sorted_indices))
+    selected: list[tuple[str, int]] = []
+
+    for bucket_index, label in enumerate(("short", "medium", "long")):
+        bucket = sorted_indices[boundaries[bucket_index] : boundaries[bucket_index + 1]]
+        count = min(examples_per_bucket, len(bucket))
+        for sample_index in range(count):
+            # Interior quantiles avoid selecting only the most extreme lengths.
+            position = ((sample_index + 1) * len(bucket)) // (count + 1)
+            selected.append((label, bucket[position]))
+    return selected
+
+
 def causal_mask(size: int, *, device: torch.device | None = None) -> torch.Tensor:
     """Return a lower-triangular mask with shape ``(1, size, size)``."""
     return torch.ones((1, size, size), dtype=torch.bool, device=device).tril()

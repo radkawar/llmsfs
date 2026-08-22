@@ -1,5 +1,6 @@
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -42,11 +43,14 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)  # (1, seq_len, d_model)
         self.register_buffer("pe", pe)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.size(1) > self.seq_len:
-            raise ValueError(f"Sequence length {x.size(1)} exceeds the configured maximum of {self.seq_len}")
+    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        end_pos = start_pos + x.size(1)
+        if start_pos < 0:
+            raise ValueError("start_pos cannot be negative")
+        if end_pos > self.seq_len:
+            raise ValueError(f"Position {end_pos} exceeds the configured maximum of {self.seq_len}")
         pe = self.get_buffer("pe")
-        x = x + pe[:, : x.shape[1], :]
+        x = x + pe[:, start_pos:end_pos, :]
         return self.dropout(x)
 
 
@@ -94,6 +98,35 @@ class MultiHeadAttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.attention_scores: torch.Tensor | None = None
 
+    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Change (batch, length, d_model) into (batch, heads, length, d_k)."""
+        return x.view(x.shape[0], x.shape[1], self.h, self.d_k).transpose(1, 2)
+
+    def _combine_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """Change (batch, heads, length, d_k) back into (batch, length, d_model)."""
+        return x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.d_model)
+
+    def _apply_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.use_fused_attention:
+            x = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+            self.attention_scores = None
+            return x
+
+        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+        return x
+
     @staticmethod
     def attention(
         query: torch.Tensor,
@@ -124,32 +157,58 @@ class MultiHeadAttentionBlock(nn.Module):
         v: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        query = self.w_q(q)  # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-        key = self.w_k(k)  # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-        value = self.w_v(v)  # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
-
-        # (batch, seq_len, d_model) --> (batch, seq_len, h, d_k) --> (batch, h, seq_len, d_k)
-        query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
-        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
-        value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
-
-        if self.use_fused_attention:
-            x = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-            )
-            self.attention_scores = None
-        else:
-            x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+        query = self._split_heads(self.w_q(q))
+        key = self._split_heads(self.w_k(k))
+        value = self._split_heads(self.w_v(v))
+        x = self._apply_attention(query, key, value, mask)
 
         # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
-        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
+        x = self._combine_heads(x)
 
         # (batch, seq_len, d_model) --> (batch, seq_len, d_model)
         return self.w_o(x)
+
+    def forward_cached(
+        self,
+        q: torch.Tensor,
+        key_value: torch.Tensor,
+        mask: torch.Tensor | None,
+        cache: "AttentionKVCache | None",
+        *,
+        static_key_value: bool,
+    ) -> tuple[torch.Tensor, "AttentionKVCache"]:
+        """Attend one decoding step while reusing projected keys and values."""
+        query = self._split_heads(self.w_q(q))
+
+        if static_key_value and cache is not None:
+            key = cache.key
+            value = cache.value
+        else:
+            key = self._split_heads(self.w_k(key_value))
+            value = self._split_heads(self.w_v(key_value))
+            if cache is not None:
+                key = torch.cat((cache.key, key), dim=2)
+                value = torch.cat((cache.value, value), dim=2)
+
+        updated_cache = AttentionKVCache(key=key, value=value)
+        x = self._apply_attention(query, key, value, mask)
+        return self.w_o(self._combine_heads(x)), updated_cache
+
+
+@dataclass
+class AttentionKVCache:
+    """Projected attention keys and values with shape (batch, heads, length, d_k)."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass
+class DecoderLayerCache:
+    """Self- and cross-attention state belonging to one decoder layer."""
+
+    self_attention: AttentionKVCache | None = None
+    cross_attention: AttentionKVCache | None = None
 
 
 class ResidualConnection(nn.Module):
@@ -160,6 +219,10 @@ class ResidualConnection(nn.Module):
 
     def forward(self, x: torch.Tensor, sublayer: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
         return x + self.dropout(sublayer(self.norm(x)))
+
+    def add(self, x: torch.Tensor, sublayer_output: torch.Tensor) -> torch.Tensor:
+        """Add an already pre-normalized sublayer result to the residual stream."""
+        return x + self.dropout(sublayer_output)
 
 
 class EncoderBlock(nn.Module):
@@ -230,6 +293,38 @@ class DecoderBlock(nn.Module):
         x = self.feed_forward_residual(x, self.feed_forward_block)
         return x
 
+    def forward_step(
+        self,
+        x: torch.Tensor,
+        encoder_output: torch.Tensor,
+        src_mask: torch.Tensor | None,
+        cache: DecoderLayerCache | None,
+    ) -> tuple[torch.Tensor, DecoderLayerCache]:
+        """Decode one token and return the updated inference-only KV cache."""
+        cache = DecoderLayerCache() if cache is None else cache
+
+        normalized_x = self.self_attention_residual.norm(x)
+        self_attention_output, self_attention_cache = self.self_attention_block.forward_cached(
+            normalized_x,
+            normalized_x,
+            None,
+            cache.self_attention,
+            static_key_value=False,
+        )
+        x = self.self_attention_residual.add(x, self_attention_output)
+
+        normalized_x = self.cross_attention_residual.norm(x)
+        cross_attention_output, cross_attention_cache = self.cross_attention_block.forward_cached(
+            normalized_x,
+            encoder_output,
+            src_mask,
+            cache.cross_attention,
+            static_key_value=True,
+        )
+        x = self.cross_attention_residual.add(x, cross_attention_output)
+        x = self.feed_forward_residual(x, self.feed_forward_block)
+        return x, DecoderLayerCache(self_attention_cache, cross_attention_cache)
+
 
 class Decoder(nn.Module):
     def __init__(self, features: int, layers: list[DecoderBlock]) -> None:
@@ -249,6 +344,25 @@ class Decoder(nn.Module):
                 raise TypeError("Decoder contains an unexpected layer type")
             x = layer(x, encoder_output, src_mask, tgt_mask)
         return self.norm(x)
+
+    def forward_step(
+        self,
+        x: torch.Tensor,
+        encoder_output: torch.Tensor,
+        src_mask: torch.Tensor | None,
+        cache: list[DecoderLayerCache] | None,
+    ) -> tuple[torch.Tensor, list[DecoderLayerCache]]:
+        if cache is not None and len(cache) != len(self.layers):
+            raise ValueError(f"Expected {len(self.layers)} decoder cache entries, received {len(cache)}")
+
+        updated_cache: list[DecoderLayerCache] = []
+        for index, layer in enumerate(self.layers):
+            if not isinstance(layer, DecoderBlock):
+                raise TypeError("Decoder contains an unexpected layer type")
+            layer_cache = None if cache is None else cache[index]
+            x, new_layer_cache = layer.forward_step(x, encoder_output, src_mask, layer_cache)
+            updated_cache.append(new_layer_cache)
+        return self.norm(x), updated_cache
 
 
 class ProjectionLayer(nn.Module):
@@ -309,6 +423,21 @@ class Transformer(nn.Module):
         tgt = self.tgt_embed(tgt)
         tgt = self.tgt_pos(tgt)
         return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+
+    def decode_step(
+        self,
+        encoder_output: torch.Tensor,
+        src_mask: torch.Tensor | None,
+        tgt_token: torch.Tensor,
+        position: int,
+        cache: list[DecoderLayerCache] | None = None,
+    ) -> tuple[torch.Tensor, list[DecoderLayerCache]]:
+        """Decode one target position, reusing attention state from earlier positions."""
+        if tgt_token.ndim != 2 or tgt_token.size(1) != 1:
+            raise ValueError("tgt_token must have shape (batch, 1)")
+        tgt = self.tgt_embed(tgt_token)
+        tgt = self.tgt_pos(tgt, start_pos=position)
+        return self.decoder.forward_step(tgt, encoder_output, src_mask, cache)
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
         # (batch, seq_len, vocab_size)
