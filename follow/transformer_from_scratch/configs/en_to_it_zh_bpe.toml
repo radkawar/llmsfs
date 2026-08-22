@@ -1,0 +1,58 @@
+name = "English to Italian and Mandarin - shared byte-level BPE"
+default_target_language = "it"
+
+tokenizer_type = "byte_bpe"
+tokenizer_vocab_size = 32000
+tokenizer_min_frequency = 2
+shared_tokenizer = true
+target_language_tags = true
+tokenizer_folder = "artifacts/en-to-it-zh/byte_bpe-v32000/tokenizers"
+tokenizer_filename = "shared.json"
+
+checkpoint_folder = "artifacts/en-to-it-zh/byte_bpe-v32000/checkpoints"
+model_basename = "tmodel_"
+preload = "latest"
+experiment_folder = "artifacts/en-to-it-zh/byte_bpe-v32000/runs"
+
+batch_size = 64
+num_epochs = 10
+lr = 0.0003
+seq_len = 320
+d_model = 512
+seed = 1337
+precision = "auto"
+
+pad_to_multiple_of = 8
+bucket_size_multiplier = 10
+log_every = 100
+use_fused_attention = false
+tie_target_embeddings = true
+tie_source_target_embeddings = true
+
+validation_max_len = 320
+validation_examples_per_bucket = 2
+validation_beam_size = 3
+validation_length_penalty = 0.6
+validation_no_repeat_ngram_size = 3
+
+[[language_pairs]]
+datasource = "Helsinki-NLP/opus-100"
+dataset_config = "en-it"
+lang_src = "en"
+lang_tgt = "it"
+train_split = "train"
+validation_split = "validation"
+validation_fraction = 0.0
+max_train_samples = 1000000
+validation_example_indices = []
+
+[[language_pairs]]
+datasource = "Helsinki-NLP/opus-100"
+dataset_config = "en-zh"
+lang_src = "en"
+lang_tgt = "zh"
+train_split = "train"
+validation_split = "validation"
+validation_fraction = 0.0
+max_train_samples = 1000000
+validation_example_indices = []

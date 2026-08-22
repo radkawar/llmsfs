@@ -9,6 +9,18 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = PROJECT_DIR / "configs" / "en_it_bpe.toml"
 
 
+class LanguagePairConfig(TypedDict):
+    datasource: str
+    dataset_config: str
+    lang_src: str
+    lang_tgt: str
+    train_split: str
+    validation_split: str
+    validation_fraction: float
+    max_train_samples: int
+    validation_example_indices: list[int]
+
+
 class TransformerConfig(TypedDict):
     name: str
     batch_size: int
@@ -16,10 +28,8 @@ class TransformerConfig(TypedDict):
     lr: float
     seq_len: int
     d_model: int
-    datasource: str
-    dataset_config: str
-    lang_src: str
-    lang_tgt: str
+    language_pairs: list[LanguagePairConfig]
+    default_target_language: str
     model_basename: str
     preload: str | None
     checkpoint_folder: str
@@ -29,6 +39,8 @@ class TransformerConfig(TypedDict):
     tokenizer_type: TokenizerType
     tokenizer_vocab_size: int
     tokenizer_min_frequency: int
+    shared_tokenizer: bool
+    target_language_tags: bool
     seed: int
     precision: Literal["auto", "float32", "float16", "bfloat16"]
     pad_to_multiple_of: int
@@ -36,9 +48,9 @@ class TransformerConfig(TypedDict):
     log_every: int
     use_fused_attention: bool
     tie_target_embeddings: bool
+    tie_source_target_embeddings: bool
     validation_max_len: int
     validation_examples_per_bucket: int
-    validation_example_indices: list[int]
     validation_beam_size: int
     validation_length_penalty: float
     validation_no_repeat_ngram_size: int
@@ -78,6 +90,26 @@ def load_config(config_path: str | Path | None = None) -> TransformerConfig:
     tokenizer_type = raw_config["tokenizer_type"]
     if tokenizer_type not in {"wordlevel", "byte_bpe"}:
         raise ValueError(f"Unknown tokenizer_type {tokenizer_type!r} in {resolved_path}")
+
+    raw_pairs = raw_config["language_pairs"]
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise ValueError(f"language_pairs must be a non-empty array in {resolved_path}")
+    required_pair_keys = set(LanguagePairConfig.__required_keys__)
+    for index, raw_pair in enumerate(raw_pairs):
+        if not isinstance(raw_pair, dict):
+            raise ValueError(f"language_pairs[{index}] must be a table in {resolved_path}")
+        missing_pair_keys = sorted(required_pair_keys - raw_pair.keys())
+        unexpected_pair_keys = sorted(raw_pair.keys() - required_pair_keys)
+        if missing_pair_keys or unexpected_pair_keys:
+            raise ValueError(
+                f"Invalid language_pairs[{index}] in {resolved_path}: missing={missing_pair_keys}, unexpected={unexpected_pair_keys}"
+            )
+
+    target_languages = {pair["lang_tgt"] for pair in raw_pairs}
+    if raw_config["default_target_language"] not in target_languages:
+        raise ValueError("default_target_language must match one of the configured target languages")
+    if raw_config["tie_source_target_embeddings"] and not raw_config["shared_tokenizer"]:
+        raise ValueError("tie_source_target_embeddings requires shared_tokenizer=true")
     return cast(TransformerConfig, raw_config)
 
 

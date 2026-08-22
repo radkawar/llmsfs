@@ -2,6 +2,7 @@ import argparse
 import shutil
 import time
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import TypedDict, cast
 
 from runtime import configure_runtime, resolve_amp_dtype, select_device
@@ -14,10 +15,11 @@ from datasets import load_dataset
 from tokenizers import Tokenizer
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.text import BLEUScore, CharErrorRate, WordErrorRate
+from torchmetrics.text import CHRFScore, SacreBLEUScore, CharErrorRate, WordErrorRate
 from tqdm.auto import tqdm
 
 from config import (
+    LanguagePairConfig,
     TransformerConfig,
     get_experiment_path,
     get_tokenizer_file_path,
@@ -30,6 +32,7 @@ from dataset import (
     BilingualBatch,
     BilingualCollator,
     BilingualDataset,
+    CombinedBilingualDataset,
     LengthBucketBatchSampler,
     SortedBatchSampler,
     TranslationRows,
@@ -45,6 +48,30 @@ class ValidationMetrics(TypedDict):
     cer: float
     wer: float
     bleu: float
+    chrf: float
+
+
+@dataclass(frozen=True)
+class RawPairDatasets:
+    pair: LanguagePairConfig
+    train: HFDataset
+    validation: HFDataset
+
+
+@dataclass(frozen=True)
+class ValidationLoaders:
+    target_language: str
+    loss: DataLoader[BilingualBatch]
+    generation: DataLoader[BilingualBatch]
+    length_buckets: list[str]
+
+
+@dataclass(frozen=True)
+class TrainingData:
+    train: DataLoader[BilingualBatch]
+    validation: list[ValidationLoaders]
+    tokenizer_src: Tokenizer
+    tokenizer_tgt: Tokenizer
 
 
 def evaluate_validation_loss(
@@ -56,6 +83,7 @@ def evaluate_validation_loss(
     print_msg: Callable[[str], None],
     global_step: int,
     writer: SummaryWriter | None,
+    target_language: str,
 ) -> float:
     """Measure teacher-forced, token-weighted loss over the full validation split."""
     model.eval()
@@ -86,9 +114,10 @@ def evaluate_validation_loss(
     if total_tokens == 0:
         raise ValueError("The validation split contained no target tokens")
     average_loss = (total_loss / total_tokens).item()
-    print_msg(f"Full teacher-forced validation | loss {average_loss:.3f} | {total_tokens:,} target tokens")
+    metric_prefix = f"validation/{target_language}"
+    print_msg(f"{target_language.upper()} full teacher-forced validation | loss {average_loss:.3f} | {total_tokens:,} target tokens")
     if writer is not None:
-        writer.add_scalar("validation/loss", average_loss, global_step)
+        writer.add_scalar(f"{metric_prefix}/loss", average_loss, global_step)
     return average_loss
 
 
@@ -106,6 +135,7 @@ def run_validation(
     beam_size: int,
     length_penalty: float,
     no_repeat_ngram_size: int,
+    target_language: str,
 ) -> ValidationMetrics:
     model.eval()
     expected: list[str] = []
@@ -141,7 +171,7 @@ def run_validation(
             target_tokens = batch["target_token_count"]
 
             print_msg("-" * console_width)
-            print_msg(f"{bucket.upper()} SAMPLE | source {source_tokens} tokens | target {target_tokens} tokens")
+            print_msg(f"{target_language.upper()} {bucket.upper()} SAMPLE | source {source_tokens} tokens | target {target_tokens} tokens")
             print_msg(f"{'SOURCE: ':>12}{source_text}")
             print_msg(f"{'TARGET: ':>12}{target_text}")
             print_msg(f"{'PREDICTED: ':>12}{model_out_text}")
@@ -149,23 +179,29 @@ def run_validation(
         print_msg("-" * console_width)
 
     if not predicted:
-        return {"cer": 0.0, "wer": 0.0, "bleu": 0.0}
+        return {"cer": 0.0, "wer": 0.0, "bleu": 0.0, "chrf": 0.0}
 
+    per_sentence_references = [[text] for text in expected]
+    bleu_tokenizer = "zh" if target_language == "zh" else "13a"
     metrics: ValidationMetrics = {
         "cer": CharErrorRate()(predicted, expected).item(),
         "wer": WordErrorRate()(predicted, expected).item(),
-        "bleu": BLEUScore()(predicted, expected).item(),
+        "bleu": SacreBLEUScore(tokenize=bleu_tokenizer, smooth=True)(predicted, [expected]).item(),
+        "chrf": CHRFScore(n_word_order=0)(predicted, per_sentence_references).item(),
     }
     strategy = "greedy" if beam_size == 1 else f"beam {beam_size}"
     print_msg(
-        f"Representative generation ({strategy}, {len(predicted)} examples) | "
-        f"CER {metrics['cer']:.3f} | WER {metrics['wer']:.3f} | BLEU {metrics['bleu']:.3f}"
+        f"{target_language.upper()} representative generation ({strategy}, {len(predicted)} examples) | "
+        f"CER {metrics['cer']:.3f} | WER {metrics['wer']:.3f} | "
+        f"chrF {metrics['chrf']:.3f} | BLEU {metrics['bleu']:.3f}"
     )
 
     if writer is not None:
-        writer.add_scalar("validation/cer", metrics["cer"], global_step)
-        writer.add_scalar("validation/wer", metrics["wer"], global_step)
-        writer.add_scalar("validation/bleu", metrics["bleu"], global_step)
+        metric_prefix = f"validation/{target_language}"
+        writer.add_scalar(f"{metric_prefix}/cer", metrics["cer"], global_step)
+        writer.add_scalar(f"{metric_prefix}/wer", metrics["wer"], global_step)
+        writer.add_scalar(f"{metric_prefix}/bleu", metrics["bleu"], global_step)
+        writer.add_scalar(f"{metric_prefix}/chrf", metrics["chrf"], global_step)
         writer.flush()
     return metrics
 
@@ -177,63 +213,131 @@ def get_all_sentences(ds: HFDataset, language: str) -> Iterator[str]:
         yield translations[language]
 
 
-def get_or_build_tokenizer(config: TransformerConfig, ds: HFDataset, language: str) -> Tokenizer:
-    tokenizer_path = get_tokenizer_file_path(config, language)
+def _regular_dataset(dataset: object, description: str) -> HFDataset:
+    if not isinstance(dataset, HFDataset):
+        raise TypeError(f"Expected a regular Hugging Face Dataset for {description}")
+    return dataset
+
+
+def load_raw_language_pairs(config: TransformerConfig) -> list[RawPairDatasets]:
+    raw_pairs: list[RawPairDatasets] = []
+    for pair in config["language_pairs"]:
+        train = _regular_dataset(
+            load_dataset(pair["datasource"], pair["dataset_config"], split=pair["train_split"]),
+            f"{pair['dataset_config']} training",
+        )
+        if pair["validation_split"]:
+            validation = _regular_dataset(
+                load_dataset(pair["datasource"], pair["dataset_config"], split=pair["validation_split"]),
+                f"{pair['dataset_config']} validation",
+            )
+        else:
+            split = train.train_test_split(test_size=pair["validation_fraction"], seed=config["seed"])
+            train = _regular_dataset(split["train"], f"{pair['dataset_config']} split training")
+            validation = _regular_dataset(split["test"], f"{pair['dataset_config']} split validation")
+
+        max_train_samples = pair["max_train_samples"]
+        if max_train_samples > 0 and len(train) > max_train_samples:
+            train = train.shuffle(seed=config["seed"]).select(range(max_train_samples))
+        raw_pairs.append(RawPairDatasets(pair=pair, train=train, validation=validation))
+    return raw_pairs
+
+
+def get_or_build_tokenizer(
+    config: TransformerConfig,
+    sentences: Iterator[str],
+    artifact_language: str,
+    additional_special_tokens: list[str],
+) -> Tokenizer:
+    tokenizer_path = get_tokenizer_file_path(config, artifact_language)
     if tokenizer_path.exists():
-        print(f"Loading {config['tokenizer_type']} {language} tokenizer: {tokenizer_path}")
+        print(f"Loading {config['tokenizer_type']} {artifact_language} tokenizer: {tokenizer_path}")
         return Tokenizer.from_file(str(tokenizer_path))
 
-    print(f"Training {config['tokenizer_type']} {language} tokenizer (vocab target {config['tokenizer_vocab_size']:,})...")
+    print(f"Training {config['tokenizer_type']} {artifact_language} tokenizer (vocab target {config['tokenizer_vocab_size']:,})...")
     tokenizer = build_tokenizer(
         config["tokenizer_type"],
-        get_all_sentences(ds, language),
+        sentences,
         config["tokenizer_vocab_size"],
         config["tokenizer_min_frequency"],
+        additional_special_tokens,
     )
     tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(tokenizer_path))
     return tokenizer
 
 
-def get_ds(
-    config: TransformerConfig,
-) -> tuple[
-    DataLoader[BilingualBatch],
-    DataLoader[BilingualBatch],
-    DataLoader[BilingualBatch],
-    list[str],
-    Tokenizer,
-    Tokenizer,
-]:
-    raw_dataset = load_dataset(
-        config["datasource"],
-        config["dataset_config"],
-        split="train",
-    )
-    if not isinstance(raw_dataset, HFDataset):
-        raise TypeError("Expected a regular Hugging Face Dataset")
+def _multilingual_sentences(raw_pairs: list[RawPairDatasets]) -> Iterator[str]:
+    for raw_pair in raw_pairs:
+        yield from get_all_sentences(raw_pair.train, raw_pair.pair["lang_src"])
+        yield from get_all_sentences(raw_pair.train, raw_pair.pair["lang_tgt"])
 
-    tokenizer_src = get_or_build_tokenizer(config, raw_dataset, config["lang_src"])
-    tokenizer_tgt = get_or_build_tokenizer(config, raw_dataset, config["lang_tgt"])
-    split = raw_dataset.train_test_split(test_size=0.1, seed=config["seed"])
 
-    print("Pre-tokenizing the dataset once...")
-    train_ds = BilingualDataset(
-        cast(TranslationRows, split["train"]),
-        tokenizer_src,
-        tokenizer_tgt,
-        config["lang_src"],
-        config["lang_tgt"],
-        config["seq_len"],
-    )
-    val_ds = BilingualDataset(
-        cast(TranslationRows, split["test"]),
-        tokenizer_src,
-        tokenizer_tgt,
-        config["lang_src"],
-        config["lang_tgt"],
-        config["seq_len"],
-    )
+def _target_tag(language: str) -> str:
+    return f"[TO_{language.upper()}]"
+
+
+def get_ds(config: TransformerConfig) -> TrainingData:
+    raw_pairs = load_raw_language_pairs(config)
+    if len(raw_pairs) > 1 and not config["shared_tokenizer"]:
+        raise ValueError("Multiple language pairs require shared_tokenizer=true")
+
+    target_tags = [_target_tag(pair.pair["lang_tgt"]) for pair in raw_pairs] if config["target_language_tags"] else []
+    if config["shared_tokenizer"]:
+        shared_tokenizer = get_or_build_tokenizer(
+            config,
+            _multilingual_sentences(raw_pairs),
+            "shared",
+            target_tags,
+        )
+        tokenizer_src = shared_tokenizer
+        tokenizer_tgt = shared_tokenizer
+    else:
+        raw_pair = raw_pairs[0]
+        tokenizer_src = get_or_build_tokenizer(
+            config,
+            get_all_sentences(raw_pair.train, raw_pair.pair["lang_src"]),
+            raw_pair.pair["lang_src"],
+            target_tags,
+        )
+        tokenizer_tgt = get_or_build_tokenizer(
+            config,
+            get_all_sentences(raw_pair.train, raw_pair.pair["lang_tgt"]),
+            raw_pair.pair["lang_tgt"],
+            target_tags,
+        )
+
+    print("Pre-tokenizing the datasets once...")
+    train_datasets: list[BilingualDataset] = []
+    validation_datasets: list[tuple[LanguagePairConfig, BilingualDataset]] = []
+    for raw_pair in raw_pairs:
+        pair = raw_pair.pair
+        source_prefix_ids = [special_token_id(tokenizer_src, _target_tag(pair["lang_tgt"]))] if config["target_language_tags"] else []
+        train_dataset = BilingualDataset(
+            cast(TranslationRows, raw_pair.train),
+            tokenizer_src,
+            tokenizer_tgt,
+            pair["lang_src"],
+            pair["lang_tgt"],
+            config["seq_len"],
+            source_prefix_ids,
+        )
+        validation_dataset = BilingualDataset(
+            cast(TranslationRows, raw_pair.validation),
+            tokenizer_src,
+            tokenizer_tgt,
+            pair["lang_src"],
+            pair["lang_tgt"],
+            config["seq_len"],
+            source_prefix_ids,
+        )
+        train_datasets.append(train_dataset)
+        validation_datasets.append((pair, validation_dataset))
+        print(f"{pair['lang_src']}→{pair['lang_tgt']}: {len(train_dataset):,} training / {len(validation_dataset):,} validation pairs")
+        if train_dataset.skipped_count or validation_dataset.skipped_count:
+            print(f"  skipped over-length training/validation pairs: {train_dataset.skipped_count:,}/{validation_dataset.skipped_count:,}")
+
+    train_ds = CombinedBilingualDataset(train_datasets)
     collator = BilingualCollator(
         tokenizer_src,
         tokenizer_tgt,
@@ -250,51 +354,52 @@ def get_ds(
         DataLoader[BilingualBatch],
         DataLoader(train_ds, batch_sampler=batch_sampler, collate_fn=collator),
     )
-    validation_batch_sampler = SortedBatchSampler(val_ds, config["batch_size"])
-    validation_loss_dataloader = cast(
-        DataLoader[BilingualBatch],
-        DataLoader(val_ds, batch_sampler=validation_batch_sampler, collate_fn=collator),
-    )
+    validation_loaders: list[ValidationLoaders] = []
+    for pair, validation_dataset in validation_datasets:
+        validation_batch_sampler = SortedBatchSampler(validation_dataset, config["batch_size"])
+        validation_loss_dataloader = cast(
+            DataLoader[BilingualBatch],
+            DataLoader(validation_dataset, batch_sampler=validation_batch_sampler, collate_fn=collator),
+        )
 
-    configured_indices = config["validation_example_indices"]
-    if configured_indices:
+        configured_indices = pair["validation_example_indices"]
         examples_per_bucket = config["validation_examples_per_bucket"]
-        expected_count = 3 * examples_per_bucket
-        if len(configured_indices) != expected_count:
-            raise ValueError(f"Expected {expected_count} validation_example_indices, received {len(configured_indices)}")
-        if any(index < 0 or index >= len(val_ds) for index in configured_indices):
-            raise ValueError("A validation_example_indices entry is outside the validation split")
-        selected_examples = [
-            (("short", "medium", "long")[position // examples_per_bucket], index) for position, index in enumerate(configured_indices)
-        ]
-    else:
-        selected_examples = representative_indices(val_ds, config["validation_examples_per_bucket"])
-    length_buckets = [bucket for bucket, _ in selected_examples]
-    representative_ds = Subset(val_ds, [index for _, index in selected_examples])
-    validation_generation_dataloader = cast(
-        DataLoader[BilingualBatch],
-        DataLoader(representative_ds, batch_size=1, shuffle=False, collate_fn=collator),
-    )
+        if configured_indices:
+            expected_count = 3 * examples_per_bucket
+            if len(configured_indices) != expected_count:
+                raise ValueError(f"Expected {expected_count} validation example indices, received {len(configured_indices)}")
+            if any(index < 0 or index >= len(validation_dataset) for index in configured_indices):
+                raise ValueError("A validation example index is outside its validation split")
+            selected_examples = [
+                (("short", "medium", "long")[position // examples_per_bucket], index) for position, index in enumerate(configured_indices)
+            ]
+        else:
+            selected_examples = representative_indices(validation_dataset, examples_per_bucket)
+        length_buckets = [bucket for bucket, _ in selected_examples]
+        representative_ds = Subset(validation_dataset, [index for _, index in selected_examples])
+        generation_dataloader = cast(
+            DataLoader[BilingualBatch],
+            DataLoader(representative_ds, batch_size=1, shuffle=False, collate_fn=collator),
+        )
+        validation_loaders.append(
+            ValidationLoaders(
+                target_language=pair["lang_tgt"],
+                loss=validation_loss_dataloader,
+                generation=generation_dataloader,
+                length_buckets=length_buckets,
+            )
+        )
 
-    max_src_len = max(train_ds.max_src_len, val_ds.max_src_len)
-    max_tgt_len = max(train_ds.max_tgt_len, val_ds.max_tgt_len)
-    print(f"Maximum source/target lengths: {max_src_len}/{max_tgt_len} tokens")
-    print(f"Training/validation examples: {len(train_ds):,}/{len(val_ds):,}")
-    if train_ds.skipped_count or val_ds.skipped_count:
-        print(f"Skipped over-length training/validation pairs: {train_ds.skipped_count:,}/{val_ds.skipped_count:,}")
+    print(f"Maximum source/target lengths: {train_ds.max_src_len}/{train_ds.max_tgt_len} tokens")
+    print(f"Combined training examples: {len(train_ds):,}")
     print(f"Dynamic padding + length bucketing: {len(train_dataloader):,} batches (batch size {config['batch_size']})")
     print(
-        f"Validation: {len(validation_loss_dataloader):,} teacher-forced batches + "
-        f"{len(validation_generation_dataloader)} representative generations"
+        "Validation: "
+        + ", ".join(
+            f"{loaders.target_language}={len(loaders.loss)} batches/{len(loaders.generation)} generations" for loaders in validation_loaders
+        )
     )
-    return (
-        train_dataloader,
-        validation_loss_dataloader,
-        validation_generation_dataloader,
-        length_buckets,
-        tokenizer_src,
-        tokenizer_tgt,
-    )
+    return TrainingData(train_dataloader, validation_loaders, tokenizer_src, tokenizer_tgt)
 
 
 def get_model(config: TransformerConfig, vocab_src_len: int, vocab_tgt_len: int) -> Transformer:
@@ -306,6 +411,7 @@ def get_model(config: TransformerConfig, vocab_src_len: int, vocab_tgt_len: int)
         d_model=config["d_model"],
         use_fused_attention=config["use_fused_attention"],
         tie_target_embeddings=config["tie_target_embeddings"],
+        tie_source_target_embeddings=config["tie_source_target_embeddings"],
     )
 
 
@@ -315,6 +421,47 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:d}h {minutes:02d}m {remaining_seconds:02d}s"
     return f"{minutes:d}m {remaining_seconds:02d}s"
+
+
+def evaluate_all_languages(
+    model: Transformer,
+    validation_loaders: list[ValidationLoaders],
+    tokenizer_tgt: Tokenizer,
+    config: TransformerConfig,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    print_msg: Callable[[str], None],
+    global_step: int,
+    writer: SummaryWriter | None,
+) -> None:
+    for validation in validation_loaders:
+        evaluate_validation_loss(
+            model,
+            validation.loss,
+            tokenizer_tgt,
+            device,
+            amp_dtype,
+            print_msg,
+            global_step,
+            writer,
+            validation.target_language,
+        )
+        run_validation(
+            model,
+            validation.generation,
+            tokenizer_tgt,
+            min(config["validation_max_len"], config["seq_len"]),
+            device,
+            amp_dtype,
+            print_msg,
+            global_step,
+            writer,
+            validation.length_buckets,
+            config["validation_beam_size"],
+            config["validation_length_penalty"],
+            config["validation_no_repeat_ngram_size"],
+            validation.target_language,
+        )
 
 
 def train_model(
@@ -337,18 +484,13 @@ def train_model(
     print(f"Optimizations: dynamic padding, length bucketing, cached tokenization, {attention_backend} attention, fused LayerNorm")
     get_weights_folder_path(config).mkdir(parents=True, exist_ok=True)
 
-    (
-        train_dataloader,
-        validation_loss_dataloader,
-        validation_generation_dataloader,
-        validation_length_buckets,
-        tokenizer_src,
-        tokenizer_tgt,
-    ) = get_ds(config)
+    training_data = get_ds(config)
+    train_dataloader = training_data.train
+    tokenizer_src = training_data.tokenizer_src
+    tokenizer_tgt = training_data.tokenizer_tgt
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
     trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     print(f"Trainable parameters: {trainable_parameters / 1_000_000:.1f}M")
-
     writer = SummaryWriter(str(get_experiment_path(config)))
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -391,30 +533,16 @@ def train_model(
 
     if evaluate_only:
         try:
-            evaluate_validation_loss(
+            evaluate_all_languages(
                 model,
-                validation_loss_dataloader,
+                training_data.validation,
                 tokenizer_tgt,
+                config,
                 device,
                 amp_dtype,
                 print,
                 global_step,
                 writer,
-            )
-            run_validation(
-                model,
-                validation_generation_dataloader,
-                tokenizer_tgt,
-                min(config["validation_max_len"], config["seq_len"]),
-                device,
-                amp_dtype,
-                print,
-                global_step,
-                writer,
-                validation_length_buckets,
-                config["validation_beam_size"],
-                config["validation_length_penalty"],
-                config["validation_no_repeat_ngram_size"],
             )
         finally:
             writer.close()
@@ -504,30 +632,16 @@ def train_model(
             )
             print(f"Saved checkpoint: {checkpoint_path}")
 
-            evaluate_validation_loss(
+            evaluate_all_languages(
                 model,
-                validation_loss_dataloader,
+                training_data.validation,
                 tokenizer_tgt,
+                config,
                 device,
                 amp_dtype,
                 batch_iterator.write,
                 global_step,
                 writer,
-            )
-            run_validation(
-                model,
-                validation_generation_dataloader,
-                tokenizer_tgt,
-                min(config["validation_max_len"], config["seq_len"]),
-                device,
-                amp_dtype,
-                batch_iterator.write,
-                global_step,
-                writer,
-                validation_length_buckets,
-                config["validation_beam_size"],
-                config["validation_length_penalty"],
-                config["validation_no_repeat_ngram_size"],
             )
 
             if device.type == "mps":

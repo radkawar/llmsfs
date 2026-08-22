@@ -1,5 +1,6 @@
 import math
 import random
+from bisect import bisect_right
 from collections.abc import Iterator, Mapping
 from typing import Protocol, TypedDict, cast
 
@@ -19,6 +20,7 @@ class BilingualSample(TypedDict):
     tgt_ids: list[int]
     src_text: str
     tgt_text: str
+    target_language: str
 
 
 class BilingualBatch(TypedDict):
@@ -29,6 +31,7 @@ class BilingualBatch(TypedDict):
     label: torch.Tensor
     src_text: list[str]
     tgt_text: list[str]
+    target_language: list[str]
     source_token_count: int
     target_token_count: int
 
@@ -51,9 +54,11 @@ class BilingualDataset(Dataset[BilingualSample]):
         src_lang: str,
         tgt_lang: str,
         seq_len: int,
+        source_prefix_ids: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
+        source_prefix_ids = [] if source_prefix_ids is None else source_prefix_ids
 
         src_texts: list[str] = []
         tgt_texts: list[str] = []
@@ -80,7 +85,7 @@ class BilingualDataset(Dataset[BilingualSample]):
             tgt_encodings,
             strict=True,
         ):
-            src_ids = src_encoding.ids
+            src_ids = [*source_prefix_ids, *src_encoding.ids]
             tgt_ids = tgt_encoding.ids
             src_len = len(src_ids) + 2  # [SOS] source [EOS]
             tgt_len = len(tgt_ids) + 1  # [SOS] target / target [EOS]
@@ -94,6 +99,7 @@ class BilingualDataset(Dataset[BilingualSample]):
                     "tgt_ids": tgt_ids,
                     "src_text": src_text,
                     "tgt_text": tgt_text,
+                    "target_language": tgt_lang,
                 }
             )
             self.lengths.append(max(src_len, tgt_len))
@@ -111,6 +117,49 @@ class BilingualDataset(Dataset[BilingualSample]):
 
     def sequence_length(self, index: int) -> int:
         return self.lengths[index]
+
+
+class CombinedBilingualDataset(Dataset[BilingualSample]):
+    """Present several pre-tokenized language-pair datasets as one training set."""
+
+    def __init__(self, datasets: list[BilingualDataset]) -> None:
+        if not datasets:
+            raise ValueError("At least one bilingual dataset is required")
+        self.datasets = datasets
+        self.cumulative_sizes: list[int] = []
+        running_size = 0
+        for dataset in datasets:
+            running_size += len(dataset)
+            self.cumulative_sizes.append(running_size)
+        self.max_src_len = max(dataset.max_src_len for dataset in datasets)
+        self.max_tgt_len = max(dataset.max_tgt_len for dataset in datasets)
+        self.skipped_count = sum(dataset.skipped_count for dataset in datasets)
+
+    def __len__(self) -> int:
+        return self.cumulative_sizes[-1]
+
+    def _local_index(self, index: int) -> tuple[BilingualDataset, int]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        dataset_index = bisect_right(self.cumulative_sizes, index)
+        previous_size = 0 if dataset_index == 0 else self.cumulative_sizes[dataset_index - 1]
+        return self.datasets[dataset_index], index - previous_size
+
+    def __getitem__(self, index: int) -> BilingualSample:
+        dataset, local_index = self._local_index(index)
+        return dataset[local_index]
+
+    def sequence_length(self, index: int) -> int:
+        dataset, local_index = self._local_index(index)
+        return dataset.sequence_length(local_index)
+
+
+class SequenceLengthDataset(Protocol):
+    def __len__(self) -> int: ...
+
+    def sequence_length(self, index: int) -> int: ...
 
 
 class BilingualCollator:
@@ -175,6 +224,7 @@ class BilingualCollator:
             "label": label,
             "src_text": [sample["src_text"] for sample in samples],
             "tgt_text": [sample["tgt_text"] for sample in samples],
+            "target_language": [sample["target_language"] for sample in samples],
             "source_token_count": sum(source_lengths),
             "target_token_count": sum(target_lengths),
         }
@@ -185,7 +235,7 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
 
     def __init__(
         self,
-        dataset: BilingualDataset,
+        dataset: SequenceLengthDataset,
         batch_size: int,
         *,
         bucket_size_multiplier: int = 10,
@@ -230,7 +280,7 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
 class SortedBatchSampler(Sampler[list[int]]):
     """Visit every example once in length-sorted batches for efficient validation."""
 
-    def __init__(self, dataset: BilingualDataset, batch_size: int) -> None:
+    def __init__(self, dataset: SequenceLengthDataset, batch_size: int) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         self.dataset = dataset

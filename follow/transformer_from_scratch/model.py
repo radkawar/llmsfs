@@ -456,10 +456,15 @@ def build_transformer(
     d_ff: int = 2048,
     use_fused_attention: bool = True,
     tie_target_embeddings: bool = True,
+    tie_source_target_embeddings: bool = False,
 ) -> Transformer:
     # Create the embedding layers
     src_embed = InputEmbeddings(d_model, src_vocab_size)
     tgt_embed = InputEmbeddings(d_model, tgt_vocab_size)
+    if tie_source_target_embeddings:
+        if src_vocab_size != tgt_vocab_size:
+            raise ValueError("Source and target vocabulary sizes must match when their embeddings are tied")
+        tgt_embed.embedding.weight = src_embed.embedding.weight
 
     # Create the positional encoding layers
     src_pos = PositionalEncoding(d_model, src_seq_len, dropout)

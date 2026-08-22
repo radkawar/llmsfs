@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-from config import TransformerConfig, get_tokenizer_file_path, latest_weights_file_path, load_config
+from config import LanguagePairConfig, TransformerConfig, get_tokenizer_file_path, latest_weights_file_path, load_config
 from dataset import special_token_id
 from model import AttentionKVCache, DecoderLayerCache, Transformer, build_transformer
 
@@ -23,6 +23,8 @@ class InferenceBundle:
     device: torch.device
     amp_dtype: torch.dtype | None
     checkpoint_path: Path
+    language_pair: LanguagePairConfig
+    source_prefix_ids: tuple[int, ...]
 
 
 def decode_token_ids(tokenizer: Tokenizer, token_ids: torch.Tensor | list[int]) -> str:
@@ -35,6 +37,7 @@ def load_inference_bundle(
     config: TransformerConfig | None = None,
     checkpoint_path: str | Path | None = None,
     device: str | torch.device | None = None,
+    target_language: str | None = None,
 ) -> InferenceBundle:
     """Load tokenizers, construct the model, and restore a checkpoint."""
     config = load_config() if config is None else config
@@ -42,8 +45,19 @@ def load_inference_bundle(
     configure_runtime(resolved_device, config["seed"])
     amp_dtype = resolve_amp_dtype(resolved_device, config["precision"])
 
-    src_tokenizer_path = get_tokenizer_file_path(config, config["lang_src"])
-    tgt_tokenizer_path = get_tokenizer_file_path(config, config["lang_tgt"])
+    selected_target = config["default_target_language"] if target_language is None else target_language
+    matching_pairs = [pair for pair in config["language_pairs"] if pair["lang_tgt"] == selected_target]
+    if len(matching_pairs) != 1:
+        available = ", ".join(pair["lang_tgt"] for pair in config["language_pairs"])
+        raise ValueError(f"Target language {selected_target!r} is not uniquely configured; choose from: {available}")
+    language_pair = matching_pairs[0]
+
+    if config["shared_tokenizer"]:
+        src_tokenizer_path = get_tokenizer_file_path(config, "shared")
+        tgt_tokenizer_path = src_tokenizer_path
+    else:
+        src_tokenizer_path = get_tokenizer_file_path(config, language_pair["lang_src"])
+        tgt_tokenizer_path = get_tokenizer_file_path(config, language_pair["lang_tgt"])
     missing_tokenizers = [path for path in (src_tokenizer_path, tgt_tokenizer_path) if not path.exists()]
     if missing_tokenizers:
         missing = ", ".join(str(path) for path in missing_tokenizers)
@@ -51,6 +65,9 @@ def load_inference_bundle(
 
     tokenizer_src = Tokenizer.from_file(str(src_tokenizer_path))
     tokenizer_tgt = Tokenizer.from_file(str(tgt_tokenizer_path))
+    source_prefix_ids: tuple[int, ...] = ()
+    if config["target_language_tags"]:
+        source_prefix_ids = (special_token_id(tokenizer_src, f"[TO_{selected_target.upper()}]"),)
 
     if checkpoint_path is None:
         resolved_checkpoint = latest_weights_file_path(config)
@@ -69,6 +86,7 @@ def load_inference_bundle(
         d_model=config["d_model"],
         use_fused_attention=config["use_fused_attention"],
         tie_target_embeddings=config["tie_target_embeddings"],
+        tie_source_target_embeddings=config["tie_source_target_embeddings"],
     ).to(resolved_device)
 
     checkpoint = torch.load(resolved_checkpoint, map_location=resolved_device, weights_only=True)
@@ -85,6 +103,8 @@ def load_inference_bundle(
         device=resolved_device,
         amp_dtype=amp_dtype,
         checkpoint_path=resolved_checkpoint,
+        language_pair=language_pair,
+        source_prefix_ids=source_prefix_ids,
     )
 
 
@@ -93,15 +113,18 @@ def encode_source_sentence(
     tokenizer_src: Tokenizer,
     max_len: int,
     device: torch.device,
+    source_prefix_ids: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token_ids = tokenizer_src.encode(sentence).ids
-    padding = max_len - len(token_ids) - 2
+    padding = max_len - len(token_ids) - len(source_prefix_ids) - 2
     if padding < 0:
-        raise ValueError(f"Input has {len(token_ids)} tokens, but at most {max_len - 2} are allowed")
+        maximum_input_tokens = max_len - len(source_prefix_ids) - 2
+        raise ValueError(f"Input has {len(token_ids)} tokens, but at most {maximum_input_tokens} are allowed")
 
     source = torch.tensor(
         [
             special_token_id(tokenizer_src, "[SOS]"),
+            *source_prefix_ids,
             *token_ids,
             special_token_id(tokenizer_src, "[EOS]"),
             *([special_token_id(tokenizer_src, "[PAD]")] * padding),
@@ -399,17 +422,21 @@ def translate(
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 3,
     max_len: int | None = None,
+    target_language: str | None = None,
 ) -> str:
     """Translate one English sentence with a loaded or automatically loaded model."""
     if not sentence.strip():
         raise ValueError("The sentence cannot be empty")
 
-    bundle = load_inference_bundle() if bundle is None else bundle
+    bundle = load_inference_bundle(target_language=target_language) if bundle is None else bundle
+    if target_language is not None and target_language != bundle.language_pair["lang_tgt"]:
+        raise ValueError("target_language does not match the loaded inference bundle")
     source, source_mask = encode_source_sentence(
         sentence,
         bundle.tokenizer_src,
         bundle.config["seq_len"],
         bundle.device,
+        bundle.source_prefix_ids,
     )
     generation_limit = min(max_len or bundle.config["validation_max_len"], bundle.config["seq_len"])
     output_ids = decode(
@@ -433,6 +460,7 @@ def main() -> None:
     parser.add_argument("sentence", nargs="?", default="I am a student.")
     parser.add_argument("--config", type=str, help="TOML experiment file; defaults to configs/en_it_bpe.toml.")
     parser.add_argument("--checkpoint", type=Path, help="Use a specific .pt checkpoint instead of the latest one.")
+    parser.add_argument("--target-language", help="Configured target language code, such as it or zh.")
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--beam-size", type=int, default=3, help="Use 1 for greedy decoding; 3-5 is a practical beam width.")
     parser.add_argument("--length-penalty", type=float, default=0.6)
@@ -442,10 +470,16 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    bundle = load_inference_bundle(config=config, checkpoint_path=args.checkpoint, device=args.device)
+    bundle = load_inference_bundle(
+        config=config,
+        checkpoint_path=args.checkpoint,
+        device=args.device,
+        target_language=args.target_language,
+    )
     print(f"Device:     {bundle.device}")
     print(f"Precision:  {bundle.amp_dtype or torch.float32}")
     print(f"Checkpoint: {bundle.checkpoint_path}")
+    print(f"Direction:  {bundle.language_pair['lang_src']} -> {bundle.language_pair['lang_tgt']}")
     print(f"Search:     {'greedy' if args.beam_size == 1 else f'beam {args.beam_size}'}")
     print(f"Source:     {args.sentence}")
     print(

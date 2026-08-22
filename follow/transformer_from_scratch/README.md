@@ -65,6 +65,8 @@ The notebook exposes the same configuration, training loop, and TensorBoard logs
 
 [`configs/en_it_bpe.toml`](configs/en_it_bpe.toml) defines the complete run: dataset, languages, tokenizer type and size, model/training settings, validation samples, and artifact paths. Copy it under `configs/` to create another experiment; no edit to `config.py` is required.
 
+[`configs/en_to_it_zh_bpe.toml`](configs/en_to_it_zh_bpe.toml) defines the one-to-many multilingual experiment. It combines one million OPUS-100 pairs for each target language, prepends `[TO_IT]` or `[TO_ZH]` to every English source, trains one shared 32K byte-level BPE tokenizer, and ties the source embedding, target embedding, and vocabulary projection.
+
 `tokenization.py` exposes the common tokenizer builder interface. It currently supports `byte_bpe` and `wordlevel`, although byte-level BPE is the configured experiment.
 
 ## Training outputs
@@ -100,6 +102,27 @@ For interactive use, open `inference.ipynb`, load the model once, and edit the `
 Generation starts with `[SOS]` and predicts until `[EOS]` or the length limit. It uses an incremental KV cache: each decoder layer stores previously projected self-attention keys/values and stores its encoder cross-attention keys/values once. The decoder therefore processes only the new token instead of recomputing the entire prefix. Beam search keeps several promising partial translations and reorders their caches whenever a different parent beam wins.
 
 The byte-level BPE decoder reconstructs text directly from generated tokens. There is no punctuation regex: spacing and punctuation are present in the training representation and must be predicted by the model.
+
+## Multilingual overnight run
+
+The multilingual config starts with 10 total epochs and resumes from its own latest checkpoint by default:
+
+```bash
+uv run python follow/transformer_from_scratch/train.py \
+  --config follow/transformer_from_scratch/configs/en_to_it_zh_bpe.toml
+```
+
+Pass `--no-resume` only for the first intentionally fresh run. To continue a completed 10-epoch run through epoch 14, use `--epochs 15` without `--no-resume`.
+
+Each epoch measures teacher-forced validation loss and cached beam translations separately for Italian and Mandarin. Mandarin BLEU uses SacreBLEU's Chinese tokenizer, and character-only chrF is reported for both languages because whitespace-based WER is not meaningful for unsegmented Mandarin text.
+
+After training, select the destination at inference time:
+
+```bash
+uv run python follow/transformer_from_scratch/translate.py "I am a student." \
+  --config follow/transformer_from_scratch/configs/en_to_it_zh_bpe.toml \
+  --target-language zh
+```
 
 ## Files
 
