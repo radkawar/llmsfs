@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from runtime import resolve_amp_dtype, select_device
+
 import torch
 from tokenizers import Tokenizer
 
@@ -18,23 +20,8 @@ class InferenceBundle:
     tokenizer_src: Tokenizer
     tokenizer_tgt: Tokenizer
     device: torch.device
+    amp_dtype: torch.dtype | None
     checkpoint_path: Path
-
-
-def select_device(preferred: str | torch.device | None = None) -> torch.device:
-    if preferred is not None and str(preferred) != "auto":
-        device = torch.device(preferred)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available")
-        if device.type == "mps" and not torch.backends.mps.is_available():
-            raise RuntimeError("MPS was requested but is not available")
-        return device
-
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def load_inference_bundle(
@@ -45,6 +32,7 @@ def load_inference_bundle(
     """Load tokenizers, construct the model, and restore a checkpoint."""
     config = get_config() if config is None else config
     resolved_device = select_device(device)
+    amp_dtype = resolve_amp_dtype(resolved_device, config["precision"])
 
     src_tokenizer_path = get_tokenizer_file_path(config, config["lang_src"])
     tgt_tokenizer_path = get_tokenizer_file_path(config, config["lang_tgt"])
@@ -71,6 +59,8 @@ def load_inference_bundle(
         config["seq_len"],
         config["seq_len"],
         d_model=config["d_model"],
+        use_fused_attention=config["use_fused_attention"],
+        tie_target_embeddings=config["tie_target_embeddings"],
     ).to(resolved_device)
 
     checkpoint = torch.load(resolved_checkpoint, map_location=resolved_device, weights_only=True)
@@ -85,6 +75,7 @@ def load_inference_bundle(
         tokenizer_src=tokenizer_src,
         tokenizer_tgt=tokenizer_tgt,
         device=resolved_device,
+        amp_dtype=amp_dtype,
         checkpoint_path=resolved_checkpoint,
     )
 
@@ -122,23 +113,25 @@ def greedy_decode(
     tokenizer_tgt: Tokenizer,
     max_len: int,
     device: torch.device,
+    amp_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Generate one target token at a time using the highest-logit token."""
     sos_id = special_token_id(tokenizer_tgt, "[SOS]")
     eos_id = special_token_id(tokenizer_tgt, "[EOS]")
 
-    encoder_output = model.encode(source, source_mask)
-    decoder_input = torch.full((1, 1), sos_id, dtype=source.dtype, device=device)
+    with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+        encoder_output = model.encode(source, source_mask)
+        decoder_input = torch.full((1, 1), sos_id, dtype=source.dtype, device=device)
 
-    while decoder_input.size(1) < max_len:
-        decoder_mask = causal_mask(decoder_input.size(1), device=device)
-        decoder_output = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
-        next_token_id = int(model.project(decoder_output[:, -1]).argmax(dim=-1).item())
-        next_token = torch.tensor([[next_token_id]], dtype=source.dtype, device=device)
-        decoder_input = torch.cat((decoder_input, next_token), dim=1)
+        while decoder_input.size(1) < max_len:
+            decoder_mask = causal_mask(decoder_input.size(1), device=device)
+            decoder_output = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+            next_token_id = int(model.project(decoder_output[:, -1]).argmax(dim=-1).item())
+            next_token = torch.tensor([[next_token_id]], dtype=source.dtype, device=device)
+            decoder_input = torch.cat((decoder_input, next_token), dim=1)
 
-        if next_token_id == eos_id:
-            break
+            if next_token_id == eos_id:
+                break
 
     return decoder_input.squeeze(0)
 
@@ -162,6 +155,7 @@ def translate(sentence: str, bundle: InferenceBundle | None = None) -> str:
         bundle.tokenizer_tgt,
         bundle.config["seq_len"],
         bundle.device,
+        bundle.amp_dtype,
     )
     return bundle.tokenizer_tgt.decode(output_ids.detach().cpu().tolist(), skip_special_tokens=True)
 
@@ -175,6 +169,7 @@ def main() -> None:
 
     bundle = load_inference_bundle(checkpoint_path=args.checkpoint, device=args.device)
     print(f"Device:     {bundle.device}")
+    print(f"Precision:  {bundle.amp_dtype or torch.float32}")
     print(f"Checkpoint: {bundle.checkpoint_path}")
     print(f"Source:     {args.sentence}")
     print(f"Translation:{translate(args.sentence, bundle)}")

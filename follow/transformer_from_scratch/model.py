@@ -3,6 +3,7 @@ from collections.abc import Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class InputEmbeddings(nn.Module):
@@ -52,14 +53,15 @@ class PositionalEncoding(nn.Module):
 class LayerNormalization(nn.Module):
     def __init__(self, features: int, eps: float = 1e-6) -> None:
         super().__init__()
+        self.features = features
         self.eps = eps
         self.alpha = nn.Parameter(torch.ones(features))  # multiplied
         self.bias = nn.Parameter(torch.zeros(features))  # added
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        return self.alpha * (x - mean) / (std + self.eps) + self.bias
+        # F.layer_norm uses the backend's fused implementation instead of
+        # launching separate mean, standard-deviation, subtract, and divide ops.
+        return F.layer_norm(x, (self.features,), self.alpha, self.bias, self.eps)
 
 
 class FeedForwardBlock(nn.Module):
@@ -75,7 +77,7 @@ class FeedForwardBlock(nn.Module):
 
 
 class MultiHeadAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, h: int, dropout: float) -> None:
+    def __init__(self, d_model: int, h: int, dropout: float, use_fused_attention: bool = True) -> None:
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -83,6 +85,7 @@ class MultiHeadAttentionBlock(nn.Module):
             raise ValueError("d_model must be divisible by the number of attention heads")
 
         self.d_k = d_model // h
+        self.use_fused_attention = use_fused_attention
         self.w_q = nn.Linear(d_model, d_model)
         self.w_k = nn.Linear(d_model, d_model)
         self.w_v = nn.Linear(d_model, d_model)
@@ -106,7 +109,7 @@ class MultiHeadAttentionBlock(nn.Module):
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
 
         if mask is not None:
-            attention_scores.masked_fill_(mask == 0, -1e9)
+            attention_scores.masked_fill_(mask == 0, torch.finfo(attention_scores.dtype).min)
         # (batch, h, seq_len, seq_len)
         attention_scores = attention_scores.softmax(dim=-1)
         if dropout is not None:
@@ -130,7 +133,17 @@ class MultiHeadAttentionBlock(nn.Module):
         key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
 
-        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+        if self.use_fused_attention:
+            x = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+            self.attention_scores = None
+        else:
+            x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
 
         # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
@@ -268,6 +281,17 @@ class Transformer(nn.Module):
         self.tgt_pos = tgt_pos
         self.projection_layer = projection_layer
 
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_mask: torch.Tensor | None,
+        tgt: torch.Tensor,
+        tgt_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        encoder_output = self.encode(src, src_mask)
+        decoder_output = self.decode(encoder_output, src_mask, tgt, tgt_mask)
+        return self.project(decoder_output)
+
     def encode(self, src: torch.Tensor, src_mask: torch.Tensor | None) -> torch.Tensor:
         # (batch, seq_len, d_model)
         src = self.src_embed(src)
@@ -301,6 +325,8 @@ def build_transformer(
     h: int = 8,
     dropout: float = 0.1,
     d_ff: int = 2048,
+    use_fused_attention: bool = True,
+    tie_target_embeddings: bool = True,
 ) -> Transformer:
     # Create the embedding layers
     src_embed = InputEmbeddings(d_model, src_vocab_size)
@@ -313,7 +339,7 @@ def build_transformer(
     # Create the encoder blocks
     encoder_blocks: list[EncoderBlock] = []
     for _ in range(N):
-        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
+        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, use_fused_attention)
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
         encoder_block = EncoderBlock(d_model, encoder_self_attention_block, feed_forward_block, dropout)
         encoder_blocks.append(encoder_block)
@@ -321,8 +347,8 @@ def build_transformer(
     # Create the decoder blocks
     decoder_blocks: list[DecoderBlock] = []
     for _ in range(N):
-        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
+        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, use_fused_attention)
+        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, use_fused_attention)
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
         decoder_block = DecoderBlock(d_model, decoder_self_attention_block, decoder_cross_attention_block, feed_forward_block, dropout)
         decoder_blocks.append(decoder_block)
@@ -333,6 +359,8 @@ def build_transformer(
 
     # Create the projection layer
     projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
+    if tie_target_embeddings:
+        projection_layer.proj.weight = tgt_embed.embedding.weight
 
     # Create the transformer
     transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer)

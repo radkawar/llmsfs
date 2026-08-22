@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -20,25 +20,40 @@ class TransformerConfig(TypedDict):
     tokenizer_file: str
     experiment_name: str
     seed: int
+    precision: Literal["auto", "float32", "float16", "bfloat16"]
+    pad_to_multiple_of: int
+    bucket_size_multiplier: int
+    log_every: int
+    use_fused_attention: bool
+    tie_target_embeddings: bool
+    validation_max_len: int
 
 
 def get_config() -> TransformerConfig:
     """Return the default English-to-Italian training configuration."""
     return {
-        "batch_size": 8,
+        "batch_size": 64,
         "num_epochs": 20,
-        "lr": 1e-4,
-        "seq_len": 350,
+        "lr": 3e-4,
+        "seq_len": 320,
         "d_model": 512,
         "datasource": "Helsinki-NLP/opus_books",
         "lang_src": "en",
         "lang_tgt": "it",
-        "model_folder": "weights",
+        "model_folder": "weights_mps",
         "model_basename": "tmodel_",
         "preload": "latest",
         "tokenizer_file": "tokenizer_{0}.json",
-        "experiment_name": "runs/tmodel",
+        "experiment_name": "runs/tmodel_mps",
         "seed": 1337,
+        "precision": "auto",
+        "pad_to_multiple_of": 8,
+        "bucket_size_multiplier": 10,
+        "log_every": 20,
+        # Explicit matmul attention benchmarks faster than SDPA on MPS 2.13.
+        "use_fused_attention": False,
+        "tie_target_embeddings": True,
+        "validation_max_len": 128,
     }
 
 
